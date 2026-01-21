@@ -23,6 +23,7 @@ FORUM_PASS = os.environ.get("FORUM_PASS", "")
 # Politeness: robots says crawl-delay: 5. We'll stay above that.
 MIN_DELAY_SECONDS = float(os.environ.get("MIN_DELAY_SECONDS", "6.0"))  # >= 5
 MAX_DELAY_SECONDS = float(os.environ.get("MAX_DELAY_SECONDS", "10.0"))
+PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY", "10"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 
