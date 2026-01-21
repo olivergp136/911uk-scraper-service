@@ -91,6 +91,11 @@ def polite_sleep():
     time.sleep(delay)
 
 
+def small_jitter():
+    # Tiny pause between "profile" -> "about" like a real user click
+    time.sleep(random.uniform(0.2, 0.8))
+
+
 def fetch(session: requests.Session, url: str) -> requests.Response:
     # Basic retry with backoff for transient failures
     backoff = 2.0
@@ -306,10 +311,10 @@ def run_scrape(run_id: str, max_member_id: int):
                     ACTIVE_RUN = {"active": False, "status": "stopped", "run_id": run_id}
                     return
 
+            did_raise = False
             try:
                 # MAIN PROFILE
                 r = fetch(session, f"{BASE_URL}/members/{member_id}/")
-                polite_sleep()
 
                 if r.status_code == 404 or is_not_found(r.text):
                     not_found += 1
@@ -333,9 +338,9 @@ def run_scrape(run_id: str, max_member_id: int):
                         update_progress(member_id)
                     continue
 
-                # ABOUT PAGE (SIGNATURE)
+                # ABOUT PAGE (SIGNATURE) — tiny jitter like a normal click-through
+                small_jitter()
                 a = fetch(session, f"{BASE_URL}/members/{member_id}/about")
-                polite_sleep()
 
                 if a.status_code == 404 or is_not_found(a.text):
                     not_found += 1
@@ -368,6 +373,7 @@ def run_scrape(run_id: str, max_member_id: int):
                     update_progress(member_id)
 
             except Exception as e:
+                did_raise = True
                 errors += 1
                 msg = f"member_id={member_id}: {type(e).__name__}: {str(e)[:500]}"
                 print(f"[run {run_id}] ERROR {msg}", flush=True)
@@ -381,6 +387,11 @@ def run_scrape(run_id: str, max_member_id: int):
                 )
                 # Cool-off to avoid repeated rapid failures
                 time.sleep(20)
+
+            # One politeness delay per member ID (instead of per page).
+            # If we already hit an exception above, we already slept 20s.
+            if not did_raise:
+                polite_sleep()
 
         # Final progress + finish
         update_progress(max_member_id)
@@ -435,6 +446,7 @@ def home():
             "min_delay_seconds": MIN_DELAY_SECONDS,
             "max_delay_seconds": MAX_DELAY_SECONDS,
             "progress_every": PROGRESS_EVERY,
+            "mode": "one_polite_sleep_per_member",
         },
     }
 
