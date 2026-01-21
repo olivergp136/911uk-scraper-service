@@ -23,17 +23,15 @@ FORUM_PASS = os.environ.get("FORUM_PASS", "")
 # Politeness: robots says crawl-delay: 5. We'll stay above that.
 MIN_DELAY_SECONDS = float(os.environ.get("MIN_DELAY_SECONDS", "6.0"))  # >= 5
 MAX_DELAY_SECONDS = float(os.environ.get("MAX_DELAY_SECONDS", "10.0"))
-PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY", "10"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+
+# How often to write progress to Supabase + emit a log line
+PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY", "10"))
 
 # Cutoff: 01/01/2024 00:00 Europe/London
 DEFAULT_CUTOFF_LONDON = datetime(2024, 1, 1, 0, 0, 0, tzinfo=LONDON)
 CUTOFF_EPOCH = int(DEFAULT_CUTOFF_LONDON.timestamp())
-
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    # We only raise at runtime when endpoints are used, so deploy can still boot.
-    pass
 
 app = FastAPI(title="911uk Scraper Service")
 
@@ -99,20 +97,26 @@ def fetch(session: requests.Session, url: str) -> requests.Response:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+
             # 429 / 403 handling: slow down hard
             if r.status_code == 429:
+                print(f"[fetch] 429 on {url} (attempt {attempt}) -> backing off", flush=True)
                 time.sleep(60 * min(attempt, 5))  # 60s, 120s, 180s...
                 continue
+
             if r.status_code == 403:
-                # Treat as "pause-worthy" to avoid hammering
+                print(f"[fetch] 403 on {url} (attempt {attempt}) -> cooling off 30m", flush=True)
                 time.sleep(60 * 30)
                 continue
+
             return r
-        except requests.RequestException:
+        except requests.RequestException as e:
+            print(f"[fetch] exception on {url} (attempt {attempt}): {type(e).__name__}", flush=True)
             if attempt == MAX_RETRIES:
                 raise
             time.sleep(backoff)
             backoff *= 2
+
     raise RuntimeError("Unreachable")
 
 
@@ -122,6 +126,7 @@ def extract_xf_token(html: str) -> Optional[str]:
     We'll look for common patterns.
     """
     soup = BeautifulSoup(html, "html.parser")
+
     html_tag = soup.find("html")
     if html_tag and html_tag.get("data-csrf"):
         return html_tag.get("data-csrf")
@@ -162,17 +167,19 @@ def login(session: requests.Session) -> None:
     if r.status_code >= 400:
         raise RuntimeError(f"Login POST failed: {r.status_code}")
 
-    # Step 3: sanity check by fetching a page that typically shows logged-in state
-    # We’ll just ensure we don’t see the login form prompt.
+    # Step 3: sanity check by fetching homepage and checking for obvious logged-out prompt
     chk = fetch(session, f"{BASE_URL}/")
+    # crude but works well enough in practice
     if "Log in" in chk.text and "Stay logged in" in chk.text:
-        # Not perfect, but a decent indicator in absence of a dedicated endpoint.
         raise RuntimeError("Login may have failed (homepage still looks logged-out)")
 
 
 def is_not_found(html: str) -> bool:
-    # Based on your uploaded "not found" source:
-    return ('data-template="error"' in html) or ("Page not found" in html and "requested page could not be found" in html.lower())
+    # Based on your uploaded "not found" source
+    return (
+        'data-template="error"' in html
+        or ("Page not found" in html and "requested page could not be found" in html.lower())
+    )
 
 
 def parse_profile_main(html: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[str]]:
@@ -206,18 +213,15 @@ def parse_profile_main(html: str) -> Tuple[Optional[str], Optional[int], Optiona
     joined_epoch = find_timestamp("Joined")
     last_seen_epoch = find_timestamp("Last seen")
 
-    # Location: you had "From London" style.
-    # Common XenForo: .memberHeader-blurb contains location link or plain text.
+    # Location: often in .memberHeader-blurb ("From London")
     location = None
     blurb = soup.select_one(".memberHeader-blurb")
     if blurb:
         text = blurb.get_text(" ", strip=True)
-        # Often like "From London" or "Yas Marina · From London"
-        # We'll extract the part after "From " if present.
         lower = text.lower()
         if "from " in lower:
             idx = lower.rfind("from ")
-            location = text[idx + 5:].strip()
+            location = text[idx + 5 :].strip()
         else:
             location = text.strip() or None
 
@@ -246,74 +250,104 @@ def epoch_to_utc_ts(epoch: int) -> str:
 
 
 def run_scrape(run_id: str, max_member_id: int):
-    global STOP_FLAG
+    global STOP_FLAG, ACTIVE_RUN
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "911uk-research-scraper/1.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
+    session.headers.update(
+        {
+            "User-Agent": "911uk-research-scraper/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    )
 
     ok = skipped_inactive = skipped_no_sig = not_found = errors = 0
 
+    def update_progress(member_id: int):
+        # Update Supabase progress + emit a log line you can watch in Render
+        sb_update_run(
+            run_id,
+            {
+                "last_processed_member_id": member_id,
+                "ok_count": ok,
+                "skipped_inactive_count": skipped_inactive,
+                "skipped_no_signature_count": skipped_no_sig,
+                "not_found_count": not_found,
+                "error_count": errors,
+            },
+        )
+        print(
+            f"[run {run_id}] member_id={member_id} ok={ok} inactive={skipped_inactive} "
+            f"no_sig={skipped_no_sig} not_found={not_found} errors={errors}",
+            flush=True,
+        )
+
     try:
+        print(f"[run {run_id}] START max_member_id={max_member_id} cutoff_epoch={CUTOFF_EPOCH}", flush=True)
         login(session)
+        print(f"[run {run_id}] LOGIN OK", flush=True)
 
         for member_id in range(1, max_member_id + 1):
             with RUN_LOCK:
                 if STOP_FLAG:
-                    sb_update_run(run_id, {
-                        "status": "stopped",
-                        "finished_at": datetime.now(timezone.utc).isoformat(),
-                        "last_processed_member_id": member_id - 1,
-                        "ok_count": ok,
-                        "skipped_inactive_count": skipped_inactive,
-                        "skipped_no_signature_count": skipped_no_sig,
-                        "not_found_count": not_found,
-                        "error_count": errors,
-                    })
+                    print(f"[run {run_id}] STOP requested -> stopping at member_id={member_id}", flush=True)
+                    sb_update_run(
+                        run_id,
+                        {
+                            "status": "stopped",
+                            "finished_at": datetime.now(timezone.utc).isoformat(),
+                            "last_processed_member_id": member_id - 1,
+                            "ok_count": ok,
+                            "skipped_inactive_count": skipped_inactive,
+                            "skipped_no_signature_count": skipped_no_sig,
+                            "not_found_count": not_found,
+                            "error_count": errors,
+                        },
+                    )
+                    ACTIVE_RUN = {"active": False, "status": "stopped", "run_id": run_id}
                     return
 
-            # MAIN PROFILE
             try:
+                # MAIN PROFILE
                 r = fetch(session, f"{BASE_URL}/members/{member_id}/")
                 polite_sleep()
+
                 if r.status_code == 404 or is_not_found(r.text):
                     not_found += 1
-                    if member_id % 50 == 0:
-                        sb_update_run(run_id, {"last_processed_member_id": member_id, "not_found_count": not_found})
+                    if member_id % PROGRESS_EVERY == 0:
+                        update_progress(member_id)
                     continue
 
                 username, joined_epoch, last_seen_epoch, location = parse_profile_main(r.text)
 
-                # if no last seen, treat as skip (or could count as error)
+                # If no last seen, treat as skip
                 if not last_seen_epoch:
                     skipped_inactive += 1
-                    if member_id % 50 == 0:
-                        sb_update_run(run_id, {"last_processed_member_id": member_id, "skipped_inactive_count": skipped_inactive})
+                    if member_id % PROGRESS_EVERY == 0:
+                        update_progress(member_id)
                     continue
 
+                # Cutoff filter
                 if last_seen_epoch < CUTOFF_EPOCH:
                     skipped_inactive += 1
-                    if member_id % 50 == 0:
-                        sb_update_run(run_id, {"last_processed_member_id": member_id, "skipped_inactive_count": skipped_inactive})
+                    if member_id % PROGRESS_EVERY == 0:
+                        update_progress(member_id)
                     continue
 
                 # ABOUT PAGE (SIGNATURE)
                 a = fetch(session, f"{BASE_URL}/members/{member_id}/about")
                 polite_sleep()
+
                 if a.status_code == 404 or is_not_found(a.text):
-                    # weird, but treat as not found
                     not_found += 1
-                    if member_id % 50 == 0:
-                        sb_update_run(run_id, {"last_processed_member_id": member_id, "not_found_count": not_found})
+                    if member_id % PROGRESS_EVERY == 0:
+                        update_progress(member_id)
                     continue
 
                 signature = parse_signature_about(a.text)
                 if not signature:
                     skipped_no_sig += 1
-                    if member_id % 50 == 0:
-                        sb_update_run(run_id, {"last_processed_member_id": member_id, "skipped_no_signature_count": skipped_no_sig})
+                    if member_id % PROGRESS_EVERY == 0:
+                        update_progress(member_id)
                     continue
 
                 # COMMIT TO DB (only now)
@@ -330,45 +364,62 @@ def run_scrape(run_id: str, max_member_id: int):
                 sb_upsert_member(row)
                 ok += 1
 
-                if member_id % 50 == 0:
-                    sb_update_run(run_id, {
-                        "last_processed_member_id": member_id,
-                        "ok_count": ok,
-                        "skipped_inactive_count": skipped_inactive,
-                        "skipped_no_signature_count": skipped_no_sig,
-                        "not_found_count": not_found,
-                        "error_count": errors,
-                    })
+                if member_id % PROGRESS_EVERY == 0:
+                    update_progress(member_id)
 
             except Exception as e:
                 errors += 1
-                sb_update_run(run_id, {
-                    "last_processed_member_id": member_id,
-                    "error_count": errors,
-                    "last_error": f"member_id={member_id}: {type(e).__name__}: {str(e)[:500]}",
-                })
+                msg = f"member_id={member_id}: {type(e).__name__}: {str(e)[:500]}"
+                print(f"[run {run_id}] ERROR {msg}", flush=True)
+                sb_update_run(
+                    run_id,
+                    {
+                        "last_processed_member_id": member_id,
+                        "error_count": errors,
+                        "last_error": msg,
+                    },
+                )
                 # Cool-off to avoid repeated rapid failures
                 time.sleep(20)
 
-        # Finished
-        sb_update_run(run_id, {
-            "status": "done",
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "last_processed_member_id": max_member_id,
-            "ok_count": ok,
-            "skipped_inactive_count": skipped_inactive,
-            "skipped_no_signature_count": skipped_no_sig,
-            "not_found_count": not_found,
-            "error_count": errors,
-        })
+        # Final progress + finish
+        update_progress(max_member_id)
+        sb_update_run(
+            run_id,
+            {
+                "status": "done",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "last_processed_member_id": max_member_id,
+                "ok_count": ok,
+                "skipped_inactive_count": skipped_inactive,
+                "skipped_no_signature_count": skipped_no_sig,
+                "not_found_count": not_found,
+                "error_count": errors,
+            },
+        )
+        print(
+            f"[run {run_id}] DONE ok={ok} inactive={skipped_inactive} no_sig={skipped_no_sig} "
+            f"not_found={not_found} errors={errors}",
+            flush=True,
+        )
+        with RUN_LOCK:
+            ACTIVE_RUN = {"active": False, "status": "done", "run_id": run_id}
 
     except Exception as e:
-        sb_update_run(run_id, {
-            "status": "failed",
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "error_count": errors + 1,
-            "last_error": f"{type(e).__name__}: {str(e)[:500]}",
-        })
+        errors += 1
+        msg = f"{type(e).__name__}: {str(e)[:500]}"
+        print(f"[run {run_id}] FAILED {msg}", flush=True)
+        sb_update_run(
+            run_id,
+            {
+                "status": "failed",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "error_count": errors,
+                "last_error": msg,
+            },
+        )
+        with RUN_LOCK:
+            ACTIVE_RUN = {"active": False, "status": "failed", "run_id": run_id, "last_error": msg}
 
 
 @app.get("/")
@@ -379,7 +430,12 @@ def home():
             "POST /start": {"max_member_id": "int"},
             "POST /stop": {},
             "GET /active": {},
-        }
+        },
+        "config": {
+            "min_delay_seconds": MIN_DELAY_SECONDS,
+            "max_delay_seconds": MAX_DELAY_SECONDS,
+            "progress_every": PROGRESS_EVERY,
+        },
     }
 
 
@@ -413,6 +469,7 @@ def start(req: StartRunRequest):
             "run_id": run_id,
             "max_member_id": req.max_member_id,
             "cutoff_london": DEFAULT_CUTOFF_LONDON.isoformat(),
+            "progress_every": PROGRESS_EVERY,
         }
 
     t = threading.Thread(target=run_scrape, args=(run_id, req.max_member_id), daemon=True)
