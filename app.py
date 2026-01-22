@@ -110,6 +110,9 @@ def fetch(session: requests.Session, url: str) -> requests.Response:
                 continue
 
             if r.status_code == 403:
+                # NOTE: This is for *real* 403 responses (Cloudflare, permission, etc).
+                # Private profiles on XenForo usually return HTTP 200 with an "Oops" page,
+                # which we detect later via HTML content.
                 print(f"[fetch] 403 on {url} (attempt {attempt}) -> cooling off 30m", flush=True)
                 time.sleep(60 * 30)
                 continue
@@ -180,10 +183,19 @@ def login(session: requests.Session) -> None:
 
 
 def is_not_found(html: str) -> bool:
-    # Based on your uploaded "not found" source
+    # Based on your uploaded "not found" source (XenForo error template)
     return (
         'data-template="error"' in html
-        or ("Page not found" in html and "requested page could not be found" in html.lower())
+        or ("page not found" in html.lower() and "requested page could not be found" in html.lower())
+    )
+
+
+def is_private_profile(html: str) -> bool:
+    # XenForo privacy / restricted profile message (HTTP 200, not a real rate-limit 403)
+    lower = html.lower()
+    return (
+        "this member limits who may view their full profile" in lower
+        or "limits who may view their full profile" in lower
     )
 
 
@@ -316,6 +328,23 @@ def run_scrape(run_id: str, max_member_id: int):
                 # MAIN PROFILE
                 r = fetch(session, f"{BASE_URL}/members/{member_id}/")
 
+                # Private/restricted profile (HTTP 200 "Oops" page) — skip immediately, no cooldown.
+                if is_private_profile(r.text):
+                    errors += 1
+                    msg = f"member_id={member_id}: private_profile"
+                    print(f"[run {run_id}] ERROR {msg}", flush=True)
+                    sb_update_run(
+                        run_id,
+                        {
+                            "last_processed_member_id": member_id,
+                            "error_count": errors,
+                            "last_error": msg,
+                        },
+                    )
+                    if member_id % PROGRESS_EVERY == 0:
+                        update_progress(member_id)
+                    continue
+
                 if r.status_code == 404 or is_not_found(r.text):
                     not_found += 1
                     if member_id % PROGRESS_EVERY == 0:
@@ -341,6 +370,23 @@ def run_scrape(run_id: str, max_member_id: int):
                 # ABOUT PAGE (SIGNATURE) — tiny jitter like a normal click-through
                 small_jitter()
                 a = fetch(session, f"{BASE_URL}/members/{member_id}/about")
+
+                # Some restricted profiles may also block the about page with the same message
+                if is_private_profile(a.text):
+                    errors += 1
+                    msg = f"member_id={member_id}: private_profile_about"
+                    print(f"[run {run_id}] ERROR {msg}", flush=True)
+                    sb_update_run(
+                        run_id,
+                        {
+                            "last_processed_member_id": member_id,
+                            "error_count": errors,
+                            "last_error": msg,
+                        },
+                    )
+                    if member_id % PROGRESS_EVERY == 0:
+                        update_progress(member_id)
+                    continue
 
                 if a.status_code == 404 or is_not_found(a.text):
                     not_found += 1
