@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any, Tuple
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 BASE_URL = "https://911uk.com"
 LONDON = ZoneInfo("Europe/London")
@@ -42,7 +42,10 @@ STOP_FLAG = False
 
 
 class StartRunRequest(BaseModel):
-    max_member_id: int
+    # Start from this member id (so you can resume at e.g. 33000)
+    start_member_id: int = Field(default=1, ge=1)
+    # Stop at this member id
+    max_member_id: int = Field(..., ge=1)
 
 
 def sb_headers() -> Dict[str, str]:
@@ -54,13 +57,14 @@ def sb_headers() -> Dict[str, str]:
     }
 
 
-def sb_insert_run(max_member_id: int) -> Dict[str, Any]:
+def sb_insert_run(start_member_id: int, max_member_id: int) -> Dict[str, Any]:
     url = f"{SUPABASE_URL}/rest/v1/scrape_runs"
     payload = {
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "start_member_id": start_member_id,
         "max_member_id": max_member_id,
-        "last_processed_member_id": 0,
+        "last_processed_member_id": start_member_id - 1,
         "cutoff_london": DEFAULT_CUTOFF_LONDON.astimezone(timezone.utc).isoformat(),
     }
     r = requests.post(url, headers=sb_headers(), data=json.dumps(payload), timeout=REQUEST_TIMEOUT)
@@ -110,9 +114,7 @@ def fetch(session: requests.Session, url: str) -> requests.Response:
                 continue
 
             if r.status_code == 403:
-                # NOTE: This is for *real* 403 responses (Cloudflare, permission, etc).
-                # Private profiles on XenForo usually return HTTP 200 with an "Oops" page,
-                # which we detect later via HTML content.
+                # Real 403 responses (Cloudflare / permission / rate limiting)
                 print(f"[fetch] 403 on {url} (attempt {attempt}) -> cooling off 30m", flush=True)
                 time.sleep(60 * 30)
                 continue
@@ -143,7 +145,6 @@ def extract_xf_token(html: str) -> Optional[str]:
     if meta and meta.get("content"):
         return meta.get("content")
 
-    # Fallback: hidden input _xfToken
     inp = soup.find("input", attrs={"name": "_xfToken"})
     if inp and inp.get("value"):
         return inp.get("value")
@@ -152,17 +153,11 @@ def extract_xf_token(html: str) -> Optional[str]:
 
 
 def login(session: requests.Session) -> None:
-    """
-    Login via POST /login/login using the field names you found.
-    Must fetch a page first to get CSRF token + cookies.
-    """
-    # Step 1: load homepage to obtain cookies + token
     home = fetch(session, f"{BASE_URL}/")
     token = extract_xf_token(home.text)
     if not token:
         raise RuntimeError("Could not extract CSRF token (_xfToken/data-csrf) from homepage")
 
-    # Step 2: submit login form
     post_url = f"{BASE_URL}/login/login/"
     data = {
         "_xfToken": token,
@@ -175,15 +170,12 @@ def login(session: requests.Session) -> None:
     if r.status_code >= 400:
         raise RuntimeError(f"Login POST failed: {r.status_code}")
 
-    # Step 3: sanity check by fetching homepage and checking for obvious logged-out prompt
     chk = fetch(session, f"{BASE_URL}/")
-    # crude but works well enough in practice
     if "Log in" in chk.text and "Stay logged in" in chk.text:
         raise RuntimeError("Login may have failed (homepage still looks logged-out)")
 
 
 def is_not_found(html: str) -> bool:
-    # Based on your uploaded "not found" source (XenForo error template)
     return (
         'data-template="error"' in html
         or ("page not found" in html.lower() and "requested page could not be found" in html.lower())
@@ -191,7 +183,6 @@ def is_not_found(html: str) -> bool:
 
 
 def is_private_profile(html: str) -> bool:
-    # XenForo privacy / restricted profile message (HTTP 200, not a real rate-limit 403)
     lower = html.lower()
     return (
         "this member limits who may view their full profile" in lower
@@ -200,18 +191,13 @@ def is_private_profile(html: str) -> bool:
 
 
 def parse_profile_main(html: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[str]]:
-    """
-    Returns: username, joined_epoch, last_seen_epoch, location
-    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Username: common XenForo pattern
     username = None
     u = soup.select_one(".memberHeader-name .username")
     if u:
         username = u.get_text(strip=True)
 
-    # Joined / Last seen: find <dt> text, then next <dd> time[data-timestamp]
     def find_timestamp(label: str) -> Optional[int]:
         dt_nodes = soup.find_all("dt")
         for dt in dt_nodes:
@@ -230,7 +216,6 @@ def parse_profile_main(html: str) -> Tuple[Optional[str], Optional[int], Optiona
     joined_epoch = find_timestamp("Joined")
     last_seen_epoch = find_timestamp("Last seen")
 
-    # Location: often in .memberHeader-blurb ("From London")
     location = None
     blurb = soup.select_one(".memberHeader-blurb")
     if blurb:
@@ -247,8 +232,6 @@ def parse_profile_main(html: str) -> Tuple[Optional[str], Optional[int], Optiona
 
 def parse_signature_about(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
-
-    # Find header "Signature" and take next bbWrapper block
     headers = soup.select("h4.block-textHeader")
     for h in headers:
         if h.get_text(strip=True).lower() == "signature":
@@ -258,7 +241,6 @@ def parse_signature_about(html: str) -> Optional[str]:
                 cleaned = "\n".join([line.strip() for line in txt.splitlines() if line.strip()])
                 return cleaned if cleaned else None
             return None
-
     return None
 
 
@@ -266,7 +248,7 @@ def epoch_to_utc_ts(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
 
 
-def run_scrape(run_id: str, max_member_id: int):
+def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
     global STOP_FLAG, ACTIVE_RUN
 
     session = requests.Session()
@@ -280,7 +262,6 @@ def run_scrape(run_id: str, max_member_id: int):
     ok = skipped_inactive = skipped_no_sig = not_found = errors = 0
 
     def update_progress(member_id: int):
-        # Update Supabase progress + emit a log line you can watch in Render
         sb_update_run(
             run_id,
             {
@@ -299,11 +280,14 @@ def run_scrape(run_id: str, max_member_id: int):
         )
 
     try:
-        print(f"[run {run_id}] START max_member_id={max_member_id} cutoff_epoch={CUTOFF_EPOCH}", flush=True)
+        print(
+            f"[run {run_id}] START start_member_id={start_member_id} max_member_id={max_member_id} cutoff_epoch={CUTOFF_EPOCH}",
+            flush=True,
+        )
         login(session)
         print(f"[run {run_id}] LOGIN OK", flush=True)
 
-        for member_id in range(1, max_member_id + 1):
+        for member_id in range(start_member_id, max_member_id + 1):
             with RUN_LOCK:
                 if STOP_FLAG:
                     print(f"[run {run_id}] STOP requested -> stopping at member_id={member_id}", flush=True)
@@ -325,10 +309,8 @@ def run_scrape(run_id: str, max_member_id: int):
 
             did_raise = False
             try:
-                # MAIN PROFILE
                 r = fetch(session, f"{BASE_URL}/members/{member_id}/")
 
-                # Private/restricted profile (HTTP 200 "Oops" page) — skip immediately, no cooldown.
                 if is_private_profile(r.text):
                     errors += 1
                     msg = f"member_id={member_id}: private_profile"
@@ -353,25 +335,21 @@ def run_scrape(run_id: str, max_member_id: int):
 
                 username, joined_epoch, last_seen_epoch, location = parse_profile_main(r.text)
 
-                # If no last seen, treat as skip
                 if not last_seen_epoch:
                     skipped_inactive += 1
                     if member_id % PROGRESS_EVERY == 0:
                         update_progress(member_id)
                     continue
 
-                # Cutoff filter
                 if last_seen_epoch < CUTOFF_EPOCH:
                     skipped_inactive += 1
                     if member_id % PROGRESS_EVERY == 0:
                         update_progress(member_id)
                     continue
 
-                # ABOUT PAGE (SIGNATURE) — tiny jitter like a normal click-through
                 small_jitter()
                 a = fetch(session, f"{BASE_URL}/members/{member_id}/about")
 
-                # Some restricted profiles may also block the about page with the same message
                 if is_private_profile(a.text):
                     errors += 1
                     msg = f"member_id={member_id}: private_profile_about"
@@ -401,7 +379,6 @@ def run_scrape(run_id: str, max_member_id: int):
                         update_progress(member_id)
                     continue
 
-                # COMMIT TO DB (only now)
                 row = {
                     "member_id": member_id,
                     "username": username,
@@ -431,15 +408,11 @@ def run_scrape(run_id: str, max_member_id: int):
                         "last_error": msg,
                     },
                 )
-                # Cool-off to avoid repeated rapid failures
                 time.sleep(20)
 
-            # One politeness delay per member ID (instead of per page).
-            # If we already hit an exception above, we already slept 20s.
             if not did_raise:
                 polite_sleep()
 
-        # Final progress + finish
         update_progress(max_member_id)
         sb_update_run(
             run_id,
@@ -484,7 +457,7 @@ def home():
     return {
         "service": "911uk scraper",
         "endpoints": {
-            "POST /start": {"max_member_id": "int"},
+            "POST /start": {"start_member_id": "int (optional, default 1)", "max_member_id": "int"},
             "POST /stop": {},
             "GET /active": {},
         },
@@ -512,12 +485,15 @@ def start(req: StartRunRequest):
     if not FORUM_USER or not FORUM_PASS:
         raise HTTPException(status_code=500, detail="Forum credentials env vars not set")
 
+    if req.start_member_id > req.max_member_id:
+        raise HTTPException(status_code=400, detail="start_member_id must be <= max_member_id")
+
     with RUN_LOCK:
         if ACTIVE_RUN and ACTIVE_RUN.get("status") == "running":
             raise HTTPException(status_code=400, detail="A run is already in progress")
         STOP_FLAG = False
 
-    run = sb_insert_run(req.max_member_id)
+    run = sb_insert_run(req.start_member_id, req.max_member_id)
     run_id = run["id"]
 
     with RUN_LOCK:
@@ -525,15 +501,16 @@ def start(req: StartRunRequest):
             "active": True,
             "status": "running",
             "run_id": run_id,
+            "start_member_id": req.start_member_id,
             "max_member_id": req.max_member_id,
             "cutoff_london": DEFAULT_CUTOFF_LONDON.isoformat(),
             "progress_every": PROGRESS_EVERY,
         }
 
-    t = threading.Thread(target=run_scrape, args=(run_id, req.max_member_id), daemon=True)
+    t = threading.Thread(target=run_scrape, args=(run_id, req.start_member_id, req.max_member_id), daemon=True)
     t.start()
 
-    return {"ok": True, "run_id": run_id}
+    return {"ok": True, "run_id": run_id, "start_member_id": req.start_member_id, "max_member_id": req.max_member_id}
 
 
 @app.post("/stop")
