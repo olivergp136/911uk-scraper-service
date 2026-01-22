@@ -42,9 +42,7 @@ STOP_FLAG = False
 
 
 class StartRunRequest(BaseModel):
-    # Start from this member id (so you can resume at e.g. 33000)
     start_member_id: int = Field(default=1, ge=1)
-    # Stop at this member id
     max_member_id: int = Field(..., ge=1)
 
 
@@ -82,7 +80,6 @@ def sb_update_run(run_id: str, patch: Dict[str, Any]) -> None:
 
 def sb_upsert_member(row: Dict[str, Any]) -> None:
     url = f"{SUPABASE_URL}/rest/v1/members"
-    # Upsert by PK (member_id)
     headers = sb_headers()
     headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
     r = requests.post(url, headers=headers, data=json.dumps(row), timeout=REQUEST_TIMEOUT)
@@ -91,35 +88,37 @@ def sb_upsert_member(row: Dict[str, Any]) -> None:
 
 
 def polite_sleep():
-    delay = random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS)
-    time.sleep(delay)
+    time.sleep(random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS))
 
 
 def small_jitter():
-    # Tiny pause between "profile" -> "about" like a real user click
     time.sleep(random.uniform(0.2, 0.8))
 
 
 def fetch(session: requests.Session, url: str) -> requests.Response:
-    # Basic retry with backoff for transient failures
     backoff = 2.0
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
 
-            # 429 / 403 handling: slow down hard
             if r.status_code == 429:
                 print(f"[fetch] 429 on {url} (attempt {attempt}) -> backing off", flush=True)
-                time.sleep(60 * min(attempt, 5))  # 60s, 120s, 180s...
+                time.sleep(60 * min(attempt, 5))
                 continue
 
             if r.status_code == 403:
-                # Real 403 responses (Cloudflare / permission / rate limiting)
+                # Privacy-restricted profiles: skip immediately (NO 30m cooldown)
+                if "This member limits who may view their full profile." in (r.text or ""):
+                    print(f"[fetch] 403 privacy profile on {url} -> skipping without cooldown", flush=True)
+                    return r
+
+                # Genuine 403 blocks (Cloudflare / rate limiting / permission issues): cool off hard
                 print(f"[fetch] 403 on {url} (attempt {attempt}) -> cooling off 30m", flush=True)
                 time.sleep(60 * 30)
                 continue
 
             return r
+
         except requests.RequestException as e:
             print(f"[fetch] exception on {url} (attempt {attempt}): {type(e).__name__}", flush=True)
             if attempt == MAX_RETRIES:
@@ -131,10 +130,6 @@ def fetch(session: requests.Session, url: str) -> requests.Response:
 
 
 def extract_xf_token(html: str) -> Optional[str]:
-    """
-    XenForo often includes CSRF in <html data-csrf="..."> or meta tags.
-    We'll look for common patterns.
-    """
     soup = BeautifulSoup(html, "html.parser")
 
     html_tag = soup.find("html")
@@ -199,8 +194,7 @@ def parse_profile_main(html: str) -> Tuple[Optional[str], Optional[int], Optiona
         username = u.get_text(strip=True)
 
     def find_timestamp(label: str) -> Optional[int]:
-        dt_nodes = soup.find_all("dt")
-        for dt in dt_nodes:
+        for dt in soup.find_all("dt"):
             if dt.get_text(strip=True).lower() == label.lower():
                 dd = dt.find_next_sibling("dd")
                 if not dd:
@@ -232,8 +226,7 @@ def parse_profile_main(html: str) -> Tuple[Optional[str], Optional[int], Optiona
 
 def parse_signature_about(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
-    headers = soup.select("h4.block-textHeader")
-    for h in headers:
+    for h in soup.select("h4.block-textHeader"):
         if h.get_text(strip=True).lower() == "signature":
             wrapper = h.find_next("div", class_="bbWrapper")
             if wrapper:
@@ -311,17 +304,14 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
             try:
                 r = fetch(session, f"{BASE_URL}/members/{member_id}/")
 
+                # Private/restricted profile (200 or 403 with message) — skip immediately
                 if is_private_profile(r.text):
                     errors += 1
                     msg = f"member_id={member_id}: private_profile"
                     print(f"[run {run_id}] ERROR {msg}", flush=True)
                     sb_update_run(
                         run_id,
-                        {
-                            "last_processed_member_id": member_id,
-                            "error_count": errors,
-                            "last_error": msg,
-                        },
+                        {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg},
                     )
                     if member_id % PROGRESS_EVERY == 0:
                         update_progress(member_id)
@@ -356,11 +346,7 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
                     print(f"[run {run_id}] ERROR {msg}", flush=True)
                     sb_update_run(
                         run_id,
-                        {
-                            "last_processed_member_id": member_id,
-                            "error_count": errors,
-                            "last_error": msg,
-                        },
+                        {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg},
                     )
                     if member_id % PROGRESS_EVERY == 0:
                         update_progress(member_id)
@@ -402,11 +388,7 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
                 print(f"[run {run_id}] ERROR {msg}", flush=True)
                 sb_update_run(
                     run_id,
-                    {
-                        "last_processed_member_id": member_id,
-                        "error_count": errors,
-                        "last_error": msg,
-                    },
+                    {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg},
                 )
                 time.sleep(20)
 
@@ -441,12 +423,7 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
         print(f"[run {run_id}] FAILED {msg}", flush=True)
         sb_update_run(
             run_id,
-            {
-                "status": "failed",
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "error_count": errors,
-                "last_error": msg,
-            },
+            {"status": "failed", "finished_at": datetime.now(timezone.utc).isoformat(), "error_count": errors, "last_error": msg},
         )
         with RUN_LOCK:
             ACTIVE_RUN = {"active": False, "status": "failed", "run_id": run_id, "last_error": msg}
