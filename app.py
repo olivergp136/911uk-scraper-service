@@ -35,7 +35,6 @@ CUTOFF_EPOCH = int(DEFAULT_CUTOFF_LONDON.timestamp())
 
 app = FastAPI(title="911uk Scraper Service")
 
-# In-memory run state (source of truth stored in Supabase; this is just for live status)
 RUN_LOCK = threading.Lock()
 ACTIVE_RUN: Optional[Dict[str, Any]] = None
 STOP_FLAG = False
@@ -107,12 +106,12 @@ def fetch(session: requests.Session, url: str) -> requests.Response:
                 continue
 
             if r.status_code == 403:
-                # Privacy-restricted profiles: skip immediately (NO 30m cooldown)
+                # Privacy restricted profiles sometimes return 403 with a message.
                 if "This member limits who may view their full profile." in (r.text or ""):
                     print(f"[fetch] 403 privacy profile on {url} -> skipping without cooldown", flush=True)
                     return r
 
-                # Genuine 403 blocks (Cloudflare / rate limiting / permission issues): cool off hard
+                # Genuine 403 blocks: cool off
                 print(f"[fetch] 403 on {url} (attempt {attempt}) -> cooling off 30m", flush=True)
                 time.sleep(60 * 30)
                 continue
@@ -179,10 +178,12 @@ def is_not_found(html: str) -> bool:
 
 def is_private_profile(html: str) -> bool:
     lower = html.lower()
-    return (
-        "this member limits who may view their full profile" in lower
-        or "limits who may view their full profile" in lower
-    )
+    return "this member limits who may view their full profile" in lower
+
+
+def is_profile_not_available(html: str) -> bool:
+    # New common case you reported
+    return "This user's profile is not available." in (html or "")
 
 
 def parse_profile_main(html: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[str]]:
@@ -304,15 +305,22 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
             try:
                 r = fetch(session, f"{BASE_URL}/members/{member_id}/")
 
-                # Private/restricted profile (200 or 403 with message) — skip immediately
+                # New case: "profile not available" -> skip immediately
+                if is_profile_not_available(r.text):
+                    errors += 1
+                    msg = f"member_id={member_id}: profile_not_available"
+                    print(f"[run {run_id}] ERROR {msg}", flush=True)
+                    sb_update_run(run_id, {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg})
+                    if member_id % PROGRESS_EVERY == 0:
+                        update_progress(member_id)
+                    continue
+
+                # Private/restricted profile -> skip immediately
                 if is_private_profile(r.text):
                     errors += 1
                     msg = f"member_id={member_id}: private_profile"
                     print(f"[run {run_id}] ERROR {msg}", flush=True)
-                    sb_update_run(
-                        run_id,
-                        {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg},
-                    )
+                    sb_update_run(run_id, {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg})
                     if member_id % PROGRESS_EVERY == 0:
                         update_progress(member_id)
                     continue
@@ -340,14 +348,21 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
                 small_jitter()
                 a = fetch(session, f"{BASE_URL}/members/{member_id}/about")
 
+                # Same "not available" message could appear here too
+                if is_profile_not_available(a.text):
+                    errors += 1
+                    msg = f"member_id={member_id}: profile_not_available_about"
+                    print(f"[run {run_id}] ERROR {msg}", flush=True)
+                    sb_update_run(run_id, {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg})
+                    if member_id % PROGRESS_EVERY == 0:
+                        update_progress(member_id)
+                    continue
+
                 if is_private_profile(a.text):
                     errors += 1
                     msg = f"member_id={member_id}: private_profile_about"
                     print(f"[run {run_id}] ERROR {msg}", flush=True)
-                    sb_update_run(
-                        run_id,
-                        {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg},
-                    )
+                    sb_update_run(run_id, {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg})
                     if member_id % PROGRESS_EVERY == 0:
                         update_progress(member_id)
                     continue
@@ -386,10 +401,7 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
                 errors += 1
                 msg = f"member_id={member_id}: {type(e).__name__}: {str(e)[:500]}"
                 print(f"[run {run_id}] ERROR {msg}", flush=True)
-                sb_update_run(
-                    run_id,
-                    {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg},
-                )
+                sb_update_run(run_id, {"last_processed_member_id": member_id, "error_count": errors, "last_error": msg})
                 time.sleep(20)
 
             if not did_raise:
