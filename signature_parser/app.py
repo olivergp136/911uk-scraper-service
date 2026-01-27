@@ -313,12 +313,6 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
                         # Build member_cars rows
                         for car in cars:
                             ownership = safe_str(car.get("ownership")) or "Unknown"
-if ownership == "Unknown":
-    # Default to Current unless the evidence contains obvious sold markers
-    st = (source_text or "").lower()
-    if not re.search(r"\b(ex|ex-|sold|gone|previous|formerly|used to|was my|had|prior|old car)\b", st):
-        ownership = "Current"
-
                             make = safe_str(car.get("make"))
                             model = safe_str(car.get("model"))
                             variant = safe_str(car.get("variant"))
