@@ -3,6 +3,7 @@ import time
 import json
 import random
 import threading
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, Tuple
@@ -45,6 +46,66 @@ class StartRunRequest(BaseModel):
     max_member_id: int = Field(..., ge=1)
 
 
+# ----------------------------
+# Robust phrase detection utils
+# ----------------------------
+
+PRIVATE_PROFILE_PATTERNS = [
+    # “This member limits who may view their full profile.”
+    "this member limits who may view their full profile",
+]
+
+PROFILE_NOT_AVAILABLE_PATTERNS = [
+    # “This user's profile is not available.”
+    "this user's profile is not available",
+    # Curly apostrophe variant
+    "this user’s profile is not available",
+    # Missing apostrophe variant
+    "this users profile is not available",
+]
+
+def _normalize_text(s: str) -> str:
+    """
+    Lowercase, normalize curly quotes/apostrophes, and collapse whitespace.
+    Keeps it robust to punctuation/spacing differences while still being strict about the message meaning.
+    """
+    if not s:
+        return ""
+    s = s.lower()
+    # normalize common curly apostrophes/quotes to straight equivalents
+    s = s.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    # collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def contains_any_pattern(html: str, patterns: list[str]) -> bool:
+    """
+    True if any pattern appears in normalized html.
+    Patterns should be provided already in their 'natural' form; we normalize both sides.
+    """
+    norm = _normalize_text(html or "")
+    for p in patterns:
+        if _normalize_text(p) in norm:
+            return True
+    return False
+
+def is_private_profile(html: str) -> bool:
+    return contains_any_pattern(html, PRIVATE_PROFILE_PATTERNS)
+
+def is_profile_not_available(html: str) -> bool:
+    return contains_any_pattern(html, PROFILE_NOT_AVAILABLE_PATTERNS)
+
+def is_benign_profile_block(html: str) -> bool:
+    """
+    Any page-body message that should cause an immediate skip without cooldown/backoff/retries.
+    """
+    return is_private_profile(html) or is_profile_not_available(html)
+
+
+# ----------------------------
+# Supabase helpers
+# ----------------------------
+
 def sb_headers() -> Dict[str, str]:
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -86,6 +147,10 @@ def sb_upsert_member(row: Dict[str, Any]) -> None:
         raise RuntimeError(f"Supabase upsert member failed: {r.status_code} {r.text}")
 
 
+# ----------------------------
+# Timing / politeness
+# ----------------------------
+
 def polite_sleep():
     time.sleep(random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS))
 
@@ -94,11 +159,23 @@ def small_jitter():
     time.sleep(random.uniform(0.2, 0.8))
 
 
+# ----------------------------
+# HTTP fetch with cooldown/backoff
+# ----------------------------
+
 def fetch(session: requests.Session, url: str) -> requests.Response:
     backoff = 2.0
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            body = r.text or ""
+
+            # ✅ CRITICAL FIX:
+            # If the body contains a benign “profile unavailable / privacy” message,
+            # return immediately — no retries, no 403 cooldown, no 429 backoff.
+            if is_benign_profile_block(body):
+                print(f"[fetch] benign profile block on {url} -> returning immediately (no cooldown/retries)", flush=True)
+                return r
 
             if r.status_code == 429:
                 print(f"[fetch] 429 on {url} (attempt {attempt}) -> backing off", flush=True)
@@ -106,12 +183,7 @@ def fetch(session: requests.Session, url: str) -> requests.Response:
                 continue
 
             if r.status_code == 403:
-                # Privacy restricted profiles sometimes return 403 with a message.
-                if "This member limits who may view their full profile." in (r.text or ""):
-                    print(f"[fetch] 403 privacy profile on {url} -> skipping without cooldown", flush=True)
-                    return r
-
-                # Genuine 403 blocks: cool off
+                # Genuine 403 blocks: cool off hard
                 print(f"[fetch] 403 on {url} (attempt {attempt}) -> cooling off 30m", flush=True)
                 time.sleep(60 * 30)
                 continue
@@ -127,6 +199,10 @@ def fetch(session: requests.Session, url: str) -> requests.Response:
 
     raise RuntimeError("Unreachable")
 
+
+# ----------------------------
+# XenForo login
+# ----------------------------
 
 def extract_xf_token(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -169,21 +245,15 @@ def login(session: requests.Session) -> None:
         raise RuntimeError("Login may have failed (homepage still looks logged-out)")
 
 
+# ----------------------------
+# Page classification & parsing
+# ----------------------------
+
 def is_not_found(html: str) -> bool:
     return (
-        'data-template="error"' in html
-        or ("page not found" in html.lower() and "requested page could not be found" in html.lower())
+        'data-template="error"' in (html or "")
+        or ("page not found" in (html or "").lower() and "requested page could not be found" in (html or "").lower())
     )
-
-
-def is_private_profile(html: str) -> bool:
-    lower = html.lower()
-    return "this member limits who may view their full profile" in lower
-
-
-def is_profile_not_available(html: str) -> bool:
-    # New common case you reported
-    return "This user's profile is not available." in (html or "")
 
 
 def parse_profile_main(html: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[str]]:
@@ -241,6 +311,10 @@ def parse_signature_about(html: str) -> Optional[str]:
 def epoch_to_utc_ts(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
 
+
+# ----------------------------
+# Main run loop
+# ----------------------------
 
 def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
     global STOP_FLAG, ACTIVE_RUN
@@ -305,7 +379,6 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
             try:
                 r = fetch(session, f"{BASE_URL}/members/{member_id}/")
 
-                # New case: "profile not available" -> skip immediately
                 if is_profile_not_available(r.text):
                     errors += 1
                     msg = f"member_id={member_id}: profile_not_available"
@@ -315,7 +388,6 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
                         update_progress(member_id)
                     continue
 
-                # Private/restricted profile -> skip immediately
                 if is_private_profile(r.text):
                     errors += 1
                     msg = f"member_id={member_id}: private_profile"
@@ -348,7 +420,6 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
                 small_jitter()
                 a = fetch(session, f"{BASE_URL}/members/{member_id}/about")
 
-                # Same "not available" message could appear here too
                 if is_profile_not_available(a.text):
                     errors += 1
                     msg = f"member_id={member_id}: profile_not_available_about"
@@ -440,6 +511,10 @@ def run_scrape(run_id: str, start_member_id: int, max_member_id: int):
         with RUN_LOCK:
             ACTIVE_RUN = {"active": False, "status": "failed", "run_id": run_id, "last_error": msg}
 
+
+# ----------------------------
+# API endpoints
+# ----------------------------
 
 @app.get("/")
 def home():
