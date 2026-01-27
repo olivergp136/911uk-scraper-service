@@ -149,37 +149,55 @@ RESPONSE_SCHEMA = {
 
 
 SYSTEM_PROMPT = """You are an expert interpreter of enthusiast forum signatures with deep knowledge of Porsche shorthand.
-Your task: extract each distinct car mentioned in the signature into structured fields.
-The signature may contain multiple cars, cars on the same line, and cars spread across lines. Preserve meaning of line breaks.
+Extract each distinct car mentioned in the signature into structured fields.
 
-Hard rules:
+OUTPUT RULES (HARD):
 - Output MUST be valid JSON matching the provided schema (no prose).
 - Extract 0..N cars. If none, return {"cars": []}.
-- ownership must be exactly one of: Current, Sold, Unknown.
-  - Use Sold only when clearly indicated (sold, gone, ex-, previous, formerly, "was", etc).
-  - Use Current only when clearly indicated (current, now, my, have, "daily", etc).
-  - Otherwise Unknown.
-- Never invent details. If unsure, use nulls and/or lower confidence.
-- notes: put all extra info here (year, colours, gearbox, options, mods, locations, etc).
 - source_text MUST be a verbatim substring from the signature that supports the extracted car (may include line breaks).
+- Never invent details. If unsure, use nulls and/or lower confidence.
 
-Porsche-specific guidance:
-- If Porsche is implied by shorthand (e.g., 964/993/996/997/991/992, C2S/C4S, GT3, Turbo S), set make="Porsche".
-- model should be searchable:
-  - Examples: "911 (997.2)", "911 (997.1)", "911 (964 / 993)", "Cayman (987.2)", "Boxster (986)".
-- variant should be normalized where possible:
-  - C2/C4/C2S/C4S => Carrera 2 / Carrera 4 / Carrera 2 S / Carrera 4 S (when clearly a 911 context)
-  - "TT" in 911 context usually means Turbo (e.g., 993TT => 993 Turbo)
-- Gen 1 / Gen 2 inference for 996/997/991/992:
-  Use .1/.2 only when you can be confident (explicitly stated OR deducible from year ranges below):
+OWNERSHIP (IMPORTANT):
+- Default assumption is ownership=Current unless there is clear evidence the car is sold/previous.
+- Use Sold ONLY if the signature clearly indicates past ownership, e.g. contains tokens like:
+  "ex", "ex-", "sold", "gone", "previous", "formerly", "used to", "was my", "had", "prior", "old car".
+- Use Unknown only if the signature does not appear to be listing owned cars at all (e.g., quotes/links only), or it is genuinely ambiguous.
+- If a signature line is just a car spec (e.g. "2011 987.2 Boxster 2.9 PDK") that is Current.
+
+FIELD NORMALIZATION:
+- make: If Porsche is implied by shorthand (e.g., 964/993/996/997/991/992, C2S/C4S, GT3, Turbo, etc), set make="Porsche".
+- model: MUST be the generic model plus (optionally) an internal model designation in parentheses.
+  Examples: "911 (996.2)", "911 (997.1)", "Boxster (987.2)", "Cayman (981)", "Cayenne (957)".
+  DO NOT put the production year in model.
+- variant: Trim to the trim/derivative, e.g. "GT3", "Carrera 4S", "Turbo S", "Sport Targa".
+  DO NOT put the internal designation (996/997/987 etc) in variant if it belongs in model.
+- notes: Put the year, gearbox, colour, options, mods, and any extra descriptors here.
+
+PORSCHE SHORTHAND & INFERENCE:
+- If a year is present, it goes in notes as a year (e.g., "1988", "2011", or "94" -> 1994 if clearly 2-digit year).
+- Two-digit year handling: "94" => 1994, "03" => 2003. (If unclear, leave it as written in notes.)
+- Gen markers in text:
+  - If the text contains ".1" or ".2" attached to a generation or variant (e.g., "997.2", "GT3.2", "C4S.1"),
+    treat it as the generation marker for the platform where it makes sense.
+    Example: "996 GT3.2" => model "911 (996.2)", variant "GT3".
+- Gen 1 / Gen 2 inference when possible:
   - 996.1 ~ 1998–2001; 996.2 ~ 2002–2004
   - 997.1 ~ 2004–2008; 997.2 ~ 2009–2012
   - 991.1 ~ 2012–2015; 991.2 ~ 2016–2019
   - 992.1 ~ 2019–2023; 992.2 ~ 2024–present
-  If uncertain, omit .1/.2.
+  Use these ranges only if a year is present; otherwise do not guess unless ".1/.2" is explicitly written.
 - Crossover ambiguity:
-  If a year could map to two generations (e.g., 1994 could be late 964 or early 993), include both in model like "911 (964 / 993)".
+  If a year could map to two generations (e.g., 1994 could be late 964 or early 993), set model like "911 (964 / 993)" and put year in notes.
+
+CLASSIC 911 YEAR MAPPING (when confident):
+- If signature indicates 1984–1989 "Carrera" (incl. 1988 Carrera), model should be "911 (3.2 Carrera)" and year goes in notes.
+- If signature indicates 1989–1994 Carrera 2/4, model "911 (964)" (or "911 (964 / 993)" for 1994 ambiguity).
+- If signature indicates 1994–1998 Carrera, model "911 (993)" (or crossover if 1994 ambiguous).
+
+CONFIDENCE:
+- confidence 0..1. High confidence only when the fields are clearly supported by the signature text.
 """
+
 
 def call_ai(signature_raw: str) -> Dict[str, Any]:
     user_prompt = f"Signature:\n---\n{signature_raw}\n---\nExtract the cars from this signature."
@@ -295,6 +313,12 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
                         # Build member_cars rows
                         for car in cars:
                             ownership = safe_str(car.get("ownership")) or "Unknown"
+if ownership == "Unknown":
+    # Default to Current unless the evidence contains obvious sold markers
+    st = (source_text or "").lower()
+    if not re.search(r"\b(ex|ex-|sold|gone|previous|formerly|used to|was my|had|prior|old car)\b", st):
+        ownership = "Current"
+
                             make = safe_str(car.get("make"))
                             model = safe_str(car.get("model"))
                             variant = safe_str(car.get("variant"))
