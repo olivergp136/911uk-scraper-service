@@ -199,7 +199,9 @@ def call_ai(signature_raw: str) -> Dict[str, Any]:
         text={
             "format": {
                 "type": "json_schema",
-                "json_schema": RESPONSE_SCHEMA,
+                "name": "signature_car_extract",
+                "schema": RESPONSE_SCHEMA["schema"],
+                "strict": True,
             }
         },
         temperature=TEMPERATURE,
@@ -209,6 +211,7 @@ def call_ai(signature_raw: str) -> Dict[str, Any]:
     if not out.strip():
         return {"cars": []}
     return json.loads(out)
+
 
 # ----------------------------
 # Small helpers
