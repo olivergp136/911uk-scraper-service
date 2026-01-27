@@ -123,33 +123,30 @@ def sb_upsert_member_cars(rows: List[Dict[str, Any]]) -> None:
 # ----------------------------
 
 RESPONSE_SCHEMA = {
-    "name": "signature_car_extract",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "cars": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "ownership": {"type": "string", "enum": ["Current", "Sold", "Unknown"]},
-                        "make": {"type": ["string", "null"]},
-                        "model": {"type": ["string", "null"]},
-                        "variant": {"type": ["string", "null"]},
-                        "notes": {"type": ["string", "null"]},
-                        "source_text": {"type": "string"},
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    },
-                    "required": ["ownership", "make", "model", "variant", "notes", "source_text", "confidence"],
-                    "additionalProperties": False,
+    "type": "object",
+    "properties": {
+        "cars": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "ownership": {"type": "string", "enum": ["Current", "Sold", "Unknown"]},
+                    "make": {"type": ["string", "null"]},
+                    "model": {"type": ["string", "null"]},
+                    "variant": {"type": ["string", "null"]},
+                    "notes": {"type": ["string", "null"]},
+                    "source_text": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 },
-            }
-        },
-        "required": ["cars"],
-        "additionalProperties": False,
+                "required": ["ownership", "make", "model", "variant", "notes", "source_text", "confidence"],
+                "additionalProperties": False,
+            },
+        }
     },
+    "required": ["cars"],
+    "additionalProperties": False,
 }
+
 
 SYSTEM_PROMPT = """You are an expert interpreter of enthusiast forum signatures with deep knowledge of Porsche shorthand.
 Your task: extract each distinct car mentioned in the signature into structured fields.
@@ -185,9 +182,6 @@ Porsche-specific guidance:
 """
 
 def call_ai(signature_raw: str) -> Dict[str, Any]:
-    """
-    Calls the model with Structured Outputs (JSON Schema), so it returns strict JSON.
-    """
     user_prompt = f"Signature:\n---\n{signature_raw}\n---\nExtract the cars from this signature."
 
     resp = client.responses.create(
@@ -200,7 +194,7 @@ def call_ai(signature_raw: str) -> Dict[str, Any]:
             "format": {
                 "type": "json_schema",
                 "name": "signature_car_extract",
-                "schema": RESPONSE_SCHEMA["schema"],
+                "schema": RESPONSE_SCHEMA,
                 "strict": True,
             }
         },
