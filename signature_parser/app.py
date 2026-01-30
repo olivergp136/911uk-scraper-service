@@ -30,7 +30,7 @@ SLEEP_BETWEEN_MEMBERS = float(os.environ.get("SLEEP_BETWEEN_MEMBERS", "0.15"))
 
 # Optional: enable repair pass (second model call) when contradictions are detected
 ENABLE_REPAIR_PASS = os.environ.get("ENABLE_REPAIR_PASS", "true").strip().lower() in ("1", "true", "yes", "y")
-REPAIR_MODEL = os.environ.get("REPAIR_MODEL", MODEL)  # can set to a cheaper model if you want
+REPAIR_MODEL = os.environ.get("REPAIR_MODEL", MODEL)  # can set to cheaper model if you want
 
 app = FastAPI(title="911uk Signature Parser Service")
 
@@ -124,21 +124,28 @@ def sb_fetch_members_page(after_member_id: int, max_member_id: int, limit: int) 
 def sb_upsert_member_cars(rows: List[Dict[str, Any]]) -> None:
     """
     Upsert into member_cars using your unique index ux_member_cars_dedupe.
+
+    IMPORTANT:
+    We explicitly set the conflict target via on_conflict to avoid 409 duplicate key crashes.
     """
     if not rows:
         return
-    url = f"{SUPABASE_URL}/rest/v1/member_cars"
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/member_cars"
+        f"?on_conflict=member_id,ownership,make,model,variant,source_text"
+    )
     headers = sb_headers(prefer="resolution=merge-duplicates,return=minimal")
     r = requests.post(url, headers=headers, data=json.dumps(rows), timeout=REQUEST_TIMEOUT)
     if r.status_code >= 300:
         raise RuntimeError(f"Supabase upsert member_cars failed: {r.status_code} {r.text}")
 
 # ----------------------------
-# Prompt + schema (LLM extraction)
+# Prompt (LLM extraction)
 # ----------------------------
 
 SYSTEM_PROMPT = r"""
-You are an expert interpreter of enthusiast forum signatures with deep knowledge of Porsche models, generations, variants, and community shorthand.
+You are an expert interpreter of enthusiast forum signatures with deep knowledge of car models, Porsche generations/variants, and enthusiast shorthand.
 
 Your task:
 Parse the raw forum signature text and extract 0..N owned cars into structured records.
@@ -162,10 +169,34 @@ Rules:
 - Avoid over-splitting when details continue across lines.
 - Ignore non-vehicle lines (URLs, slogans, quotes, ads).
 
+--------------------------------
+PORSCHE DETECTION (COMMON)
+--------------------------------
 A chunk is a CAR if it contains any of:
 - Porsche platform tokens (964, 993, 996, 997, 991, 992, 986, 987, 981, 718, 982, 957, 958, 930)
 - Porsche models (911, Boxster, Cayman, Cayenne, Panamera, Macan, 944, 968, 356)
 - Porsche variants (C2, C4, C2S, C4S, GT3, GT2, Turbo, Turbo S, GTS, RS, Spyder, Targa, Dakar, Sport Classic, S/T)
+
+--------------------------------
+NON-PORSCHE CARS (MUST HANDLE)
+--------------------------------
+Many signatures include non-Porsche cars too. You MUST extract those as separate car records.
+
+A chunk is also a CAR if it contains clear non-Porsche vehicle cues such as:
+- A known non-Porsche make name (BMW, Mercedes, Audi, VW, Ford, Ferrari, Aston Martin, Jaguar, Land Rover, Mini, Lotus, Nissan, Toyota, Honda, Mazda, Subaru, Renault, Peugeot, Alfa Romeo, Volvo, Tesla, etc.)
+- A model+platform pattern (e.g., "E46 M3", "F80 M3", "R53 Cooper S", "C6 RS6", "W204 C63")
+- Common trim/performance badges (AMG, M3, M5, RS, GTI, ST, Type R, WRX, Vantage, DB9, F430, etc.)
+
+IMPORTANT (implicit makes):
+Sometimes the brand is not written. If the model name strongly implies a make, infer it.
+Examples:
+- "V8 Vantage" => Aston Martin
+- "DB9" / "DB11" / "Vanquish" => Aston Martin
+- "F430" / "458" / "488" / "360" => Ferrari
+- "Gallardo" / "Huracan" => Lamborghini
+- "Range Rover" / "Defender" / "Discovery" => Land Rover
+- "M3" / "M5" with E/F/G codes => BMW
+Only infer make if the model/trim is strongly distinctive; otherwise leave make null and lower confidence.
 
 --------------------------------
 OWNERSHIP (IMPORTANT)
@@ -177,11 +208,12 @@ Only "Sold" if explicit tokens in that chunk: ex, ex-, sold, gone, previous, for
 --------------------------------
 FIELDS
 --------------------------------
-- make: usually "Porsche" if Porsche shorthand present.
-- model: MUST be normalized as Family + (Platform), e.g. "911 (993)" / "Boxster (987.2)" / "Cayenne (957)".
-  DO NOT put a year in model.
-- variant: production variant/trim only (e.g. "Carrera 4S", "GT3 RS", "Turbo S", "Dakar", "Sport Classic", "S/T").
-- notes: MUST contain any model years, colours, engine sizes, gearbox, option codes, modifications, "since 2003", etc.
+- make: explicit brand if present; otherwise infer only when very distinctive (see implicit makes above).
+- model:
+  - Porsche: MUST be Family + (Platform) e.g. "911 (993)" / "Boxster (987.2)" / "Cayenne (957)". NEVER put year in model.
+  - Non-Porsche: use the primary model line, optionally with platform in parentheses if explicit (e.g., "M3 (E46)", "C63 (W204)").
+- variant: trim/edition/derivative only (e.g. "Carrera 4S", "GT3 RS", "Turbo S", "Competition", "AMG", "Type R").
+- notes: MUST include any model years, colours, engine sizes, gearbox, option codes, modifications, "since 2003", etc.
   (If present anywhere in the chunk, put it in notes.)
 
 --------------------------------
@@ -210,6 +242,9 @@ For each car, include an "evidence" object that captures the key tokens you used
 - platform_token: e.g. "993", "996.2", "987.2", "957" etc if present or strongly implied
 - ownership_token: e.g. "ex", "sold", "gone" if present; otherwise null
 - notes_tokens: short list of tokens you considered notes-worthy (colours, gearbox, engine size, codes, mods)
+
+IMPORTANT:
+- NEVER treat Porsche platform codes like 996/993/997 as a model year.
 
 --------------------------------
 FINAL OUTPUT
@@ -257,7 +292,6 @@ def call_ai(signature_raw: str) -> Dict[str, Any]:
 def repair_ai(signature_raw: str, bad_car_obj: Dict[str, Any], issues: List[str]) -> Optional[Dict[str, Any]]:
     """
     Second-pass repair for a single car object when we detect contradictions.
-    We keep it narrow note: this is optional and gated by ENABLE_REPAIR_PASS.
     """
     if not ENABLE_REPAIR_PASS:
         return None
@@ -271,7 +305,7 @@ def repair_ai(signature_raw: str, bad_car_obj: Dict[str, Any], issues: List[str]
             "Do NOT invent facts; only correct contradictions.",
             "Do NOT put years in model; put them in notes.",
             "Default ownership to Current unless explicit sold/ex evidence exists.",
-            "Never treat platform codes like 996/993/997 as years.",
+            "Never treat Porsche platform codes like 996/993/997/987 as years.",
             "Return ONLY a JSON object with keys: ownership, make, model, variant, notes, source_text, confidence, evidence.",
         ],
     }
@@ -290,13 +324,12 @@ def repair_ai(signature_raw: str, bad_car_obj: Dict[str, Any], issues: List[str]
     if not out.strip():
         return None
     fixed = json.loads(out)
-    # Ensure it's a single car-like dict
     if not isinstance(fixed, dict):
         return None
     return fixed
 
 # ----------------------------
-# Small helpers
+# Helpers
 # ----------------------------
 
 def clamp01(x: float) -> float:
@@ -326,7 +359,7 @@ def ensure_notes_contains_many(notes: Optional[str], tokens: List[str]) -> Optio
     return out
 
 # ----------------------------
-# “Constraint layer”: validate + correct only the impossible bits
+# Constraint layer (minimal, but prevents “impossible” outputs)
 # ----------------------------
 
 PLATFORM_TOKENS = {
@@ -341,32 +374,29 @@ PLATFORM_TOKENS = {
     "957", "958",
 }
 
-SOLD_TOKENS = {"ex", "ex-", "sold", "gone", "previous", "formerly", "prior", "used to own", "was my", "had", "(sold)"}
+SOLD_WORDS_RE = re.compile(r"\b(ex|ex-|sold|gone|previous|formerly|prior|used to own|was my|had|\(sold\))\b", re.I)
+MODEL_YEAR_IN_PARENS_RE = re.compile(r"\(\s*(19\d{2}|20\d{2})\s*\)")
 
 def normalize_year_token_to_int(year_token: Optional[str]) -> Optional[int]:
     """
-    We *mostly* trust the model’s evidence.year_token.
-    This is only a minimal normalizer, not a full parser:
-    - "1988" -> 1988
-    - "'97", "97", "MY97", "97MY" -> 1997
+    Minimal normalizer for model-provided evidence.year_token.
+    Reject platform-like tokens (e.g. 996).
     """
     if not year_token:
         return None
     t = year_token.strip().replace("’", "'").upper()
 
-    # Reject platform-like tokens outright
+    # hard reject Porsche platform codes as years
     if t in {p.upper() for p in PLATFORM_TOKENS}:
         return None
 
-    # 4-digit
+    # 4-digit year
     m4 = re.fullmatch(r"(19\d{2}|20\d{2})", t)
     if m4:
         y = int(m4.group(1))
-        if 1960 <= y <= 2035:
-            return y
-        return None
+        return y if 1960 <= y <= 2035 else None
 
-    # 2-digit forms: '97, 97, MY97, 97MY
+    # 2-digit year tokens: '97, 97, MY97, 97MY
     m2 = re.fullmatch(r"(?:MY)?'?(?P<yy>\d{2})(?:MY)?", t)
     if m2:
         yy = int(m2.group("yy"))
@@ -381,7 +411,7 @@ def is_911_family_text(source_text: str, model: Optional[str], variant: Optional
     m = (model or "").lower()
     v = (variant or "").lower()
     cues = ["911", "carrera", "turbo", "gt3", "gt2", "rs", "targa", "dakar", "sport classic", "s/t"]
-    return any(c in st for c in cues) or "911" in m or any(c in v for c in cues)
+    return any(c in st for c in cues) or m.startswith("911") or any(c in v for c in cues)
 
 def platform_from_year_for_911(year: int) -> Optional[str]:
     if 1964 <= year <= 1973:
@@ -416,8 +446,6 @@ def platform_from_year_for_911(year: int) -> Optional[str]:
         return "911 (992.2)"
     return None
 
-MODEL_YEAR_IN_PARENS_RE = re.compile(r"\(\s*(19\d{2}|20\d{2})\s*\)")
-
 def move_year_out_of_model(model: Optional[str], notes: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     if not model:
         return model, notes
@@ -435,27 +463,18 @@ def move_year_out_of_model(model: Optional[str], notes: Optional[str]) -> Tuple[
 def normalize_ownership(ownership: Optional[str], evidence_ownership_token: Optional[str], source_text: str) -> str:
     """
     Business rule: Current unless explicit sold/ex evidence exists.
-    We trust evidence_ownership_token if present; otherwise scan source_text lightly.
     """
     tok = (evidence_ownership_token or "").strip().lower()
-    if tok and tok in SOLD_TOKENS:
+    if tok and SOLD_WORDS_RE.search(tok):
         return "Sold"
-
-    st = (source_text or "").lower()
-    if any(t in st for t in [" ex ", "ex-", " sold", "gone", "previous", "formerly", "prior", "used to own", "was my", "(sold)"]):
+    if SOLD_WORDS_RE.search(source_text or ""):
         return "Sold"
-
     return "Current"
 
 def apply_gt3_dot2_hint(model: Optional[str], source_text: str, platform_token: Optional[str]) -> Optional[str]:
-    """
-    If user writes GT3.2 and we have a platform, interpret as platform gen 2 for common 911 watercooled platforms.
-    e.g. "996 GT3.2" => 911 (996.2)
-    """
     st = (source_text or "").lower()
     if "gt3.2" not in st and "gt3 .2" not in st:
         return model
-
     pt = (platform_token or "").strip().lower()
     if pt.startswith("996"):
         return "911 (996.2)"
@@ -465,7 +484,7 @@ def apply_gt3_dot2_hint(model: Optional[str], source_text: str, platform_token: 
         return "911 (991.2)"
     if pt.startswith("992"):
         return "911 (992.2)"
-    # if note says 996 somewhere
+    # fallback: look in source text
     if "996" in st:
         return "911 (996.2)"
     if "997" in st:
@@ -476,12 +495,10 @@ def apply_gt3_dot2_hint(model: Optional[str], source_text: str, platform_token: 
         return "911 (992.2)"
     return model
 
-def validate_and_fix_car(
-    car: Dict[str, Any],
-) -> Tuple[Dict[str, Any], List[str], bool]:
+def validate_and_fix_car(car: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], bool]:
     """
     Returns: (fixed_car, issues, needs_repair_pass)
-    We keep this minimal: enforce invariants & correct contradictions.
+    Minimal “rail” layer: enforce invariants + fix contradictions.
     """
     issues: List[str] = []
     needs_repair = False
@@ -502,66 +519,65 @@ def validate_and_fix_car(
     if not isinstance(notes_tokens, list):
         notes_tokens = []
 
-    # 1) ownership hard default
+    # Must have evidence substring
+    if not source_text.strip():
+        return {}, ["missing_source_text"], False
+
+    # 1) Ownership: force default Current unless sold evidence exists
     fixed_ownership = normalize_ownership(ownership, ownership_token, source_text)
-    if fixed_ownership != ownership and ownership is not None:
+    if ownership and ownership != fixed_ownership:
         issues.append(f"ownership_corrected:{ownership}->{fixed_ownership}")
     ownership = fixed_ownership
 
-    # 2) never allow year in model
+    # 2) Never year in model
     model, notes = move_year_out_of_model(model, notes)
 
-    # 3) push notes tokens into notes (model years, colours, mods, etc)
+    # 3) Put notes tokens into notes
     clean_notes_tokens = [str(t).strip() for t in notes_tokens if str(t).strip()]
     if clean_notes_tokens:
         notes = ensure_notes_contains_many(notes, clean_notes_tokens)
 
-    # 4) if evidence contains a year token, ensure it goes into notes (always)
+    # 4) Year token normalization (trust model evidence, but block platform tokens)
     year_int = normalize_year_token_to_int(year_token)
     if year_int:
         notes = ensure_notes_contains(notes, str(year_int))
 
-    # 5) NEVER treat platform token as year (guard)
+    # 5) Guard: year_token must not equal platform_token
     if year_token and platform_token and year_token.strip().lower() == platform_token.strip().lower():
         issues.append("year_token_equals_platform_token")
         needs_repair = True
-        # drop year_token usage; year is not trustworthy here
         year_int = None
 
-    # 6) apply GT3.2 hint (only uses platform_token / source_text)
+    # 6) GT3.2 hint
     model = apply_gt3_dot2_hint(model, source_text, platform_token)
 
-    # 7) If platform_token is present and looks legitimate, ensure model reflects it (but do NOT overwrite with nonsense)
-    if platform_token:
-        pt = platform_token.strip()
-        # If it's a 911 platform token (996/997/991/992/964/993 etc), use "911 (pt)" unless model already more specific.
-        if pt in PLATFORM_TOKENS and ("911" in (model or "")) and "(" in (model or ""):
-            # If model is "911 (...)" but doesn't contain that platform, we may need repair
-            if pt not in (model or ""):
-                issues.append(f"platform_token_mismatch:model={model} platform_token={pt}")
-                needs_repair = True
-
-    # 8) 911 year->platform sanity (this is the big accuracy win)
+    # 7) 911 year->platform sanity correction (ONLY for clear 911-family)
     if year_int and is_911_family_text(source_text, model, variant):
         expected = platform_from_year_for_911(year_int)
         if expected:
-            # If model is empty or obviously wrong, correct it.
             if not model:
                 model = expected
                 issues.append(f"model_set_from_year:{expected}")
             else:
-                # If model is a 911 model but doesn't match expected platform, correct it.
                 if model.lower().startswith("911") and expected not in model:
                     issues.append(f"model_corrected_from_year:{model}->{expected}")
                     model = expected
 
-    # 9) If ownership ended up Unknown (should be rare now), force Current unless signature is truly non-car content
-    if ownership not in ("Current", "Sold", "Unknown"):
-        ownership = "Current"
-        issues.append("ownership_invalid_forced_current")
+    # 8) If the chunk explicitly contains a Porsche platform token, do NOT let year inference override it.
+    st_lower = source_text.lower()
+    explicit_platform = None
+    for tok in sorted(PLATFORM_TOKENS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(tok.lower())}\b", st_lower):
+            explicit_platform = tok
+            break
+    if explicit_platform and (model or "").lower().startswith("911"):
+        if explicit_platform not in (model or ""):
+            # This indicates the model probably output a mismatched platform
+            issues.append(f"explicit_platform_present:{explicit_platform} model={model}")
+            needs_repair = True
 
-    # Conservative confidence nudge down if we corrected things
-    if issues and confidence > 0:
+    # 9) Clamp confidence down if we corrected things
+    if issues:
         confidence = clamp01(min(confidence, 0.75))
 
     fixed = {
@@ -655,7 +671,6 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
                             if not isinstance(car, dict):
                                 continue
 
-                            # Must have evidence substring
                             if not safe_str(car.get("source_text")):
                                 continue
 
@@ -664,13 +679,12 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
                             if needs_repair:
                                 repaired = repair_ai(sig, fixed_car, issues)
                                 if repaired and isinstance(repaired, dict):
-                                    fixed_car2, issues2, _ = validate_and_fix_car(repaired)
-                                    if issues2:
-                                        # still issues after repair; keep fixed_car2 anyway
-                                        pass
-                                    fixed_car = fixed_car2
+                                    fixed2, issues2, _ = validate_and_fix_car(repaired)
+                                    fixed_car = fixed2 if fixed2 else fixed_car
 
-                            # Build DB row (table schema unchanged)
+                            if not fixed_car:
+                                continue
+
                             pending_rows.append(
                                 {
                                     "member_id": member_id,
@@ -821,8 +835,8 @@ def start(req: StartRunRequest):
 def stop():
     global STOP_FLAG
     with RUN_LOCK:
-        if not ACTIVE_RUN or ACTIVE_RUN.get("status") != "running":
-            raise HTTPException(status_code=400, detail="No active run")
-        STOP_FLAG = True
-        ACTIVE_RUN["status"] = "stopping"
-    return {"ok": True, "message": "Stopping soon (after current member finishes)."}
+        if not ACTIVE_RUN or ACTIVE_RUN.get("status") == "running":
+            STOP_FLAG = True
+            ACTIVE_RUN["status"] = "stopping"
+            return {"ok": True, "message": "Stopping soon (after current member finishes)."}
+        raise HTTPException(status_code=400, detail="No active run")
