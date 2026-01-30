@@ -4,7 +4,7 @@ import time
 import threading
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -445,6 +445,64 @@ def safe_str(v: Any) -> Optional[str]:
     return s if s else None
 
 # ----------------------------
+# Deterministic post-processing (hard rules)
+# ----------------------------
+
+YEAR_RE = re.compile(r"\b(19[7-9]\d|20[0-2]\d)\b")  # 1970–2029
+MODEL_YEAR_IN_PARENS_RE = re.compile(r"\((19[7-9]\d|20[0-2]\d)\)")
+SOLD_TOKENS_RE = re.compile(r"\b(ex|ex-|sold|gone|previous|formerly|prior|old car|used to own|was my|had)\b", re.I)
+
+def normalize_ownership(_raw: Optional[str], source_text: str) -> str:
+    """
+    Business rule:
+    - Default to Current unless explicit sold/ex tokens appear.
+    """
+    st = (source_text or "").strip()
+    if SOLD_TOKENS_RE.search(st):
+        return "Sold"
+    return "Current"
+
+def move_year_out_of_model(model: Optional[str], notes: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    If model contains a literal year (especially like 911 (1988)), remove it and push year into notes.
+    """
+    if not model:
+        return model, notes
+
+    m = model.strip()
+    m2 = MODEL_YEAR_IN_PARENS_RE.search(m)
+    if m2:
+        yr = m2.group(1)
+        m = MODEL_YEAR_IN_PARENS_RE.sub("", m).strip()
+        m = re.sub(r"\s+", " ", m).strip()
+        m = m.replace("()", "").strip()
+
+        notes_out = (notes or "").strip()
+        if yr and yr not in notes_out:
+            notes_out = (f"{yr}" if not notes_out else f"{yr}; {notes_out}")
+        return (m or None), (notes_out or None)
+
+    return model, notes
+
+def apply_gt3_dot2_hint(model: Optional[str], variant: Optional[str], source_text: str) -> Optional[str]:
+    """
+    If someone writes 'GT3.2' or '996 GT3.2', interpret .2 as gen 2 for common platforms.
+    """
+    st = (source_text or "").lower()
+
+    if "gt3.2" in st or "gt3 .2" in st:
+        if "996" in st:
+            return "911 (996.2)"
+        if "997" in st:
+            return "911 (997.2)"
+        if "991" in st:
+            return "911 (991.2)"
+        if "992" in st:
+            return "911 (992.2)"
+
+    return model
+
+# ----------------------------
 # Main run loop
 # ----------------------------
 
@@ -515,7 +573,6 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
                         cars = result.get("cars", []) if isinstance(result, dict) else []
 
                         for car in cars:
-                            ownership = safe_str(car.get("ownership")) or "Unknown"
                             make = safe_str(car.get("make"))
                             model = safe_str(car.get("model"))
                             variant = safe_str(car.get("variant"))
@@ -523,8 +580,14 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
                             source_text = safe_str(car.get("source_text")) or ""
                             confidence = clamp01(float(car.get("confidence") or 0.0))
 
+                            # Must have evidence
                             if not source_text.strip():
                                 continue
+
+                            # Hard rules
+                            ownership = normalize_ownership(safe_str(car.get("ownership")), source_text)
+                            model, notes = move_year_out_of_model(model, notes)
+                            model = apply_gt3_dot2_hint(model, variant, source_text)
 
                             pending_rows.append(
                                 {
