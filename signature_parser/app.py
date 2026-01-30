@@ -34,7 +34,19 @@ RUN_LOCK = threading.Lock()
 ACTIVE_RUN: Optional[Dict[str, Any]] = None
 STOP_FLAG = False
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ----------------------------
+# OpenAI client (lazy init)
+# ----------------------------
+
+_openai_client: Optional[OpenAI] = None
+
+def get_client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY not set")
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
 
 # ----------------------------
 # API models
@@ -97,7 +109,6 @@ def sb_fetch_members_page(after_member_id: int, max_member_id: int, limit: int) 
         "order": "member_id.asc",
         "limit": str(limit),
     }
-    # Upper bound
     params["member_id"] = f"gte.{after_member_id}"
     params["and"] = f"(member_id.lte.{max_member_id})"
 
@@ -146,7 +157,6 @@ RESPONSE_SCHEMA = {
     "required": ["cars"],
     "additionalProperties": False,
 }
-
 
 SYSTEM_PROMPT = """
 You are an expert interpreter of enthusiast forum signatures with deep knowledge of Porsche models, generations, trims, and community shorthand.
@@ -403,8 +413,6 @@ FINAL OUTPUT BEHAVIOR
 - Always include source_text.
 """
 
-
-
 def call_ai(signature_raw: str) -> Dict[str, Any]:
     user_prompt = f"Signature:\n---\n{signature_raw}\n---\nExtract the cars from this signature."
 
@@ -422,8 +430,6 @@ def call_ai(signature_raw: str) -> Dict[str, Any]:
     if not out.strip():
         return {"cars": []}
     return json.loads(out)
-
-
 
 # ----------------------------
 # Small helpers
@@ -486,7 +492,6 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
 
             members = sb_fetch_members_page(cursor, max_member_id, PAGE_SIZE)
             if not members:
-                # No more rows with signature_raw; we’re done for this range.
                 break
 
             for m in members:
@@ -500,17 +505,15 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
 
                 last_processed = member_id
 
-                # Shouldn't happen, but guard.
                 if not sig.strip():
                     continue
 
-                # Retry wrapper for AI call
                 last_err = None
                 for attempt in range(1, MAX_RETRIES + 1):
                     try:
                         result = call_ai(sig)
                         cars = result.get("cars", []) if isinstance(result, dict) else []
-                        # Build member_cars rows
+
                         for car in cars:
                             ownership = safe_str(car.get("ownership")) or "Unknown"
                             make = safe_str(car.get("make"))
@@ -520,14 +523,13 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
                             source_text = safe_str(car.get("source_text")) or ""
                             confidence = clamp01(float(car.get("confidence") or 0.0))
 
-                            # Must have evidence
                             if not source_text.strip():
                                 continue
 
                             pending_rows.append(
                                 {
                                     "member_id": member_id,
-                                    "run_id": src_run_id,  # link back to scrape run
+                                    "run_id": src_run_id,
                                     "ownership": ownership,
                                     "make": make,
                                     "model": model,
@@ -553,30 +555,27 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
                     errors += 1
                     msg = f"member_id={member_id}: {last_err}"
                     print(f"[parse {run_id}] ERROR {msg}", flush=True)
-                    sb_update_parse_run(run_id, {"last_error": msg, "error_count": errors, "last_processed_member_id": last_processed})
+                    sb_update_parse_run(
+                        run_id,
+                        {"last_error": msg, "error_count": errors, "last_processed_member_id": last_processed},
+                    )
 
-                # Periodic write & progress
                 if member_id % PROGRESS_EVERY == 0:
                     if pending_rows:
-                        # write in chunks
                         for i in range(0, len(pending_rows), WRITE_BATCH_SIZE):
                             sb_upsert_member_cars(pending_rows[i : i + WRITE_BATCH_SIZE])
                         pending_rows = []
                     progress_log()
 
-                # Gentle pacing (this is for the AI API stability/cost, not 911uk)
                 time.sleep(SLEEP_BETWEEN_MEMBERS)
 
-            # Advance cursor to next ID after the last member in this page
             cursor = int(members[-1]["member_id"]) + 1
 
-            # Flush pending rows occasionally between pages too
             if pending_rows:
                 for i in range(0, len(pending_rows), WRITE_BATCH_SIZE):
                     sb_upsert_member_cars(pending_rows[i : i + WRITE_BATCH_SIZE])
                 pending_rows = []
 
-        # Final flush + done
         if pending_rows:
             for i in range(0, len(pending_rows), WRITE_BATCH_SIZE):
                 sb_upsert_member_cars(pending_rows[i : i + WRITE_BATCH_SIZE])
