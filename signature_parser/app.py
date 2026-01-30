@@ -408,27 +408,21 @@ FINAL OUTPUT BEHAVIOR
 def call_ai(signature_raw: str) -> Dict[str, Any]:
     user_prompt = f"Signature:\n---\n{signature_raw}\n---\nExtract the cars from this signature."
 
-    resp = client.responses.create(
+    resp = get_client().chat.completions.create(
         model=MODEL,
-        input=[
+        messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "signature_car_extract",
-                "schema": RESPONSE_SCHEMA,
-                "strict": True,
-            }
-        },
+        response_format={"type": "json_object"},
         temperature=TEMPERATURE,
     )
 
-    out = resp.output_text or ""
+    out = resp.choices[0].message.content or ""
     if not out.strip():
         return {"cars": []}
     return json.loads(out)
+
 
 
 # ----------------------------
