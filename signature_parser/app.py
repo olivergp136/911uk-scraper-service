@@ -24,7 +24,7 @@ TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.1"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "60"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY", "25"))
-PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "500"))          # Supabase fetch page size
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "500"))
 WRITE_BATCH_SIZE = int(os.environ.get("WRITE_BATCH_SIZE", "500"))
 SLEEP_BETWEEN_MEMBERS = float(os.environ.get("SLEEP_BETWEEN_MEMBERS", "0.15"))
 
@@ -99,7 +99,7 @@ def sb_update_parse_run(run_id: str, patch: Dict[str, Any]) -> None:
 def sb_fetch_members_page(after_member_id: int, max_member_id: int, limit: int) -> List[Dict[str, Any]]:
     """
     Fetch a page of members ordered by member_id asc, starting at after_member_id.
-    We only want rows with signature_raw not null.
+    Only rows with signature_raw not null.
     """
     url = f"{SUPABASE_URL}/rest/v1/members"
     params = {
@@ -130,7 +130,7 @@ def sb_upsert_member_cars(rows: List[Dict[str, Any]]) -> None:
         raise RuntimeError(f"Supabase upsert member_cars failed: {r.status_code} {r.text}")
 
 # ----------------------------
-# Porsche-savvy interpretation rules (for the model)
+# Response schema + system prompt
 # ----------------------------
 
 RESPONSE_SCHEMA = {
@@ -158,8 +158,8 @@ RESPONSE_SCHEMA = {
     "additionalProperties": False,
 }
 
-SYSTEM_PROMPT = """
-You are an expert interpreter of enthusiast forum signatures with deep knowledge of Porsche models, generations, trims, and community shorthand.
+SYSTEM_PROMPT = r"""
+You are an expert interpreter of enthusiast forum signatures with deep knowledge of Porsche models, generations, trims, variants, and community shorthand.
 
 Your task:
 Parse the raw forum signature text and extract 0..N owned cars into structured records.
@@ -169,246 +169,109 @@ OUTPUT RULES (STRICT)
 --------------------------------
 - Output MUST be valid JSON matching the provided schema.
 - Output MUST contain a top-level object with key: "cars".
-- Each car must include a "source_text" field which is a VERBATIM substring supporting that car.
+- Each car MUST include "source_text" which is a VERBATIM substring supporting that car.
 - Do NOT output explanatory text or commentary.
 - Never hallucinate missing facts.
 - If unsure, use null values and lower confidence.
 
 --------------------------------
-CAR DETECTION & SEGMENTATION
---------------------------------
-Signatures may list multiple cars using:
-- Newlines
-- Pipes (|)
-- Bullets
-- Semicolons
-- Commas
-- Headings such as "Current:", "Previously:", "Ex:", "Sold:"
-
-Rules:
-- Split the signature into logical car chunks.
-- Treat a token as a new car entry ONLY if it forms a coherent standalone vehicle reference (avoid over-splitting when details continue across lines).
-- If a new year token or Porsche generation/platform token appears AND it clearly starts a new vehicle reference, treat it as a new car entry.
-- Ignore lines that clearly contain no vehicle info (slogans, URLs, quotes, insurance ads, generic signatures).
-
-A chunk is considered a CAR if it contains at least one of:
-- Porsche generation/platform tokens (964, 993, 996, 997, 991, 992, 986, 987, 981, 718, 982, 957, 958, G50, SC)
-- Porsche models (911, Boxster, Cayman, Cayenne, Panamera, Macan, 944, 968, 356)
-- Porsche trims (C2, C4, C2S, C4S, GT3, Turbo, GTS, RS, Spyder, Targa)
-
---------------------------------
 OWNERSHIP STATUS RULES
 --------------------------------
 Default:
-- Assume Status = "Current"
+- Assume ownership = "Current"
 
-Mark as "Sold" ONLY if explicit evidence exists:
-- Tokens: ex, ex-, sold, gone, previous, formerly, prior, old car, used to own, was my, had, (sold)
-- Context headers: "Previous:", "Ex:", "Sold:", "Gone:"
+Set ownership = "Sold" ONLY if explicit evidence exists in the signature chunk:
+- tokens: ex, ex-, sold, gone, previous, formerly, prior, old car, used to own, was my, had, (sold)
+- headings: "Previous:", "Ex:", "Sold:", "Gone:"
 
-Mark "Unknown" ONLY if:
-- The signature contains no ownership/garage context at all (e.g., links only, jokes only, quotes only)
+Set ownership = "Unknown" ONLY if the entire signature is non-car content (links/jokes/quotes only).
 
-If section headers exist:
-- Apply status to all entries beneath that header until changed.
+--------------------------------
+CAR DETECTION & SEGMENTATION
+--------------------------------
+Signatures may list multiple cars using newlines, pipes (|), bullets, semicolons, commas, or headings.
 
-If conflict:
-- Sold/Ex overrides Current.
+Rules:
+- Split into logical car chunks.
+- Avoid over-splitting when details continue across lines.
+- Ignore non-vehicle lines (URLs, slogans, quotes, ads).
+
+A chunk is considered a CAR if it contains any of:
+- Porsche generation/platform tokens (964, 993, 996, 997, 991, 992, 986, 987, 981, 718, 982, 957, 958, SC, G-series, 930)
+- Porsche models (911, Boxster, Cayman, Cayenne, Panamera, Macan, 944, 968, 356)
+- Porsche variants/trims (C2, C4, C2S, C4S, GT3, GT2, Turbo, Turbo S, GTS, RS, Spyder, Targa, Dakar, Sport Classic, S/T)
 
 --------------------------------
 MAKE DETECTION
 --------------------------------
-- If Porsche shorthand is present (993, C2S, GT3, Turbo, Boxster, Cayman etc) → make = "Porsche"
-- Otherwise use explicit make if stated.
-- Mixed-brand signatures should produce separate records per car.
+- If Porsche shorthand appears (993, C4S, GT3, Turbo, Boxster, Cayman etc) => make="Porsche"
+- Mixed brands => separate records per car.
 
 --------------------------------
 MODEL NORMALIZATION (CRITICAL)
 --------------------------------
-Model MUST be normalized as:
-
-Family + (Generation/Platform)
-
+Model MUST be normalized as: Family + (Generation/Platform)
 Examples:
-- "911 (996.2)"
 - "911 (993)"
+- "911 (996.2)"
 - "Boxster (987.2)"
 - "Cayman (981)"
 - "Cayenne (957)"
 - "944", "968", "356" (no parentheses needed)
-
 DO NOT place year in model.
 
 --------------------------------
 VARIANT NORMALIZATION
 --------------------------------
-Variant should contain trim only:
+Variant should contain the production variant/trim only (not the platform code, not the year).
+Examples: "Carrera 4S", "Carrera S", "Turbo S", "GT3", "GT3 RS", "GT2", "GTS", "Targa", "Dakar", "Sport Classic", "S/T".
 
-Map Porsche shorthand:
+Shorthand mapping:
+C2->Carrera 2; C4->Carrera 4; C2S->Carrera 2S; C4S->Carrera 4S.
 
-C2   → Carrera 2
-C4   → Carrera 4
-C2S  → Carrera 2S
-C4S  → Carrera 4S
-GT3  → GT3
-GT3RS / GT3 RS → GT3 RS
-Turbo → Turbo
-Turbo S → Turbo S
-GTS → GTS
-RS → RS (ONLY if not replica/tribute)
-Spyder → Spyder
-Targa → Targa
-
-Do NOT place generation/platform codes (996/997/987/etc) into variant.
+Important:
+- RS / GT3 / GT2 / S/T / Dakar are variants (keep in Variant).
+- Turbo S is a distinct production model/variant (not cosmetic pack).
 
 --------------------------------
-YEAR HANDLING
+NOTES FIELD RULES (VERY IMPORTANT)
 --------------------------------
-Acceptable formats:
-- Four digit: 1998, 2011
-- Two digit: 97, 06, '02
-
-Two-digit year normalization:
-- 70–99 → 19xx
-- 00–29 → 20xx
-
-If year is ambiguous or unclear:
-- Keep raw year in notes and reduce confidence.
-
---------------------------------
-911 GENERATION INFERENCE (WHEN NOT EXPLICIT)
---------------------------------
-Only infer when Porsche 911 is clearly referenced (911/Carrera/Turbo/GT3 etc).
-
-Year → Generation mapping:
-1974–1977 → 911 (G-Series 2.7)
-1978–1983 → 911 (SC)
-1984–1989 → 911 (3.2 Carrera)
-1989–1994 → 911 (964)
-1994–1998 → 911 (993)
-1999–2001 → 911 (996.1)
-2002–2005 → 911 (996.2)
-2005–2008 → 911 (997.1)
-2009–2012 → 911 (997.2)
-2012–2016 → 911 (991.1)
-2016–2019 → 911 (991.2)
-2019+ → 911 (992)
-
-If explicit generation token exists (e.g., "997.2", "993", "996.1"):
-- ALWAYS trust explicit token over year inference.
-
---------------------------------
-996.1 vs 996.2 SPECIAL RULES
---------------------------------
-If generation explicitly written:
-- "996.1" → 911 (996.1)
-- "996.2" → 911 (996.2)
-- "996 mk1" → 911 (996.1)
-- "996 mk2" → 911 (996.2)
-
-If only "996" present:
-
-Infer using:
-1) Year:
-- 1999–2001 → 996.1
-- 2002–2005 → 996.2
-
-2) Trim cues:
-- Presence of "C4S" → strongly implies 996.2
-
-3) Engine notes:
-- "3.4" Carrera → lean 996.1
-- "3.6" Carrera → lean 996.2
-
-If inference is weak:
-- Use model "911 (996)"
-- Store clues in notes
-- Reduce confidence.
-
---------------------------------
-BOXSTER / CAYMAN PLATFORM INFERENCE
---------------------------------
-Only infer when model family is explicit.
-
-Boxster:
-1997–2004 → Boxster (986)
-2005–2008 → Boxster (987.1)
-2009–2012 → Boxster (987.2)
-2012–2016 → Boxster (981)
-2016+ → Boxster (718 / 982)
-
-Cayman:
-2006–2008 → Cayman (987.1)
-2009–2012 → Cayman (987.2)
-2013–2016 → Cayman (981)
-2016+ → Cayman (718 / 982)
-
---------------------------------
-NOTES FIELD RULES
---------------------------------
-Place here:
-- Years (e.g., 1988, 2011, '97)
-- Colours
+Put ALL of the following into notes (if present in the signature chunk):
+- Model year (e.g., 1988, 2011, '97)
+- Colours (e.g., Guards Red, Ocean Blue, Basalt Black, etc)
 - Gearbox (Manual, PDK, Tiptronic)
-- Engine sizes (3.8, 3.4, 4.0)
-- Option codes (X50, X51)
-- Aero kits
-- "since 2003"
-- Modifiers (widebody, RS Rep, tribute)
+- Engine sizes (2.9, 3.4, 3.6, 3.8, 4.0)
+- Options/codes (X50, X51, PCCB, etc)
+- Modifications (remap, coilovers, exhaust, suspension, aero, widebody, etc)
+- ownership-ish extra context ("since 2003") but NOT the ownership label itself
 
-DO NOT include:
-- Generation/platform codes (996/997/etc)
+DO NOT put in notes:
+- Platform codes (993/996/997/987/etc) if already captured in Model
 - Repeated trim names
-- Ownership words
 
 --------------------------------
-REPLICA / TRIBUTE HANDLING
+CHEAT SHEET: 911 GENERATIONS (YEAR -> MODEL PLATFORM)
 --------------------------------
-If RS / GT3 / special trim is paired with:
-- rep
-- replica
-- tribute
+Use these rules when year is known AND the chunk is clearly a 911-family car:
+- 1964–1973 => Original/Early 911
+- 1974–1989 => G-Series / Impact bumper (incl 911 SC, 911 Carrera 3.2; Turbo=930)
+- 1989–1994 => 964
+- 1994–1998 => 993
+- 1998–2001 => 996.1
+- 2002–2004 => 996.2
+- 2004–2008 => 997.1
+- 2009–2012 => 997.2
+- 2011–2015 => 991.1
+- 2016–2019 => 991.2
+- 2019–2024 => 992.1
+- 2024+      => 992.2
 
-Then:
-- Do NOT assign special trim as Variant
-- Put replica/tribute info into Notes
-- Keep base model trim instead.
-
---------------------------------
-CROSSOVER AMBIGUITY
---------------------------------
-If year could map to two generations (e.g., 1994 964/993 crossover):
-
-Set:
-Model = "911 (964 / 993)"
-Put year in notes
-Lower confidence.
-
---------------------------------
-CONFIDENCE SCORING
---------------------------------
-Range: 0.0 – 1.0
-
-High confidence (0.85+):
-- Explicit generation/platform + trim present
-
-Medium (0.6–0.8):
-- Year inferred generation
-- Clear Porsche shorthand
-
-Low (<0.6):
-- Heavy inference
-- Partial info
-- Ambiguous ownership or model
-
-Hard cap:
-- If any key field (model platform, variant, ownership) is inferred without explicit textual support, confidence MUST NOT exceed 0.75.
+"Gen 1 / Gen 2" terminology applies mainly to 996 / 997 / 991 / 992.
 
 --------------------------------
 FINAL OUTPUT BEHAVIOR
 --------------------------------
-- Produce one JSON car object per detected owned vehicle.
-- Preserve appearance order from signature.
+- Produce one JSON car object per detected owned vehicle, preserving order.
 - Use null for missing fields.
 - Always include source_text.
 """
@@ -448,23 +311,78 @@ def safe_str(v: Any) -> Optional[str]:
 # Deterministic post-processing (hard rules)
 # ----------------------------
 
-YEAR_RE = re.compile(r"\b(19[7-9]\d|20[0-2]\d)\b")  # 1970–2029
-MODEL_YEAR_IN_PARENS_RE = re.compile(r"\((19[7-9]\d|20[0-2]\d)\)")
+# 4-digit years we reasonably expect in signatures; you can widen later if needed.
+FOUR_DIGIT_YEAR_RE = re.compile(r"\b(19[6-9]\d|20[0-2]\d)\b")  # 1960–2029
+# 2-digit year tokens like 97, '97, 97MY, MY97
+TWO_DIGIT_YEAR_RE = re.compile(r"(?:\bMY)?(\d{2})(?:\bMY|\b)", re.IGNORECASE)
+
+# Year accidentally placed in model like "911 (1988)" or "911(1988)"
+MODEL_YEAR_IN_PARENS_RE = re.compile(r"\(\s*(19[6-9]\d|20[0-2]\d)\s*\)")
+
 SOLD_TOKENS_RE = re.compile(r"\b(ex|ex-|sold|gone|previous|formerly|prior|old car|used to own|was my|had)\b", re.I)
+
+# Lightweight enrichment lists (deterministic "pull into notes" help)
+GEARBOX_TOKENS = ["pdk", "manual", "tiptronic", "tip", "cvt"]
+COMMON_COLOUR_TOKENS = [
+    "guards red", "ocean blue", "basalt black", "arctic silver", "carrera white",
+    "gt silver", "seal grey", "speed yellow", "racing yellow", "polar silver",
+    "midnight blue", "black", "white", "silver", "grey", "gray", "red", "blue", "green", "yellow"
+]
+MOD_TOKENS = [
+    "x50", "x51", "pccb", "coilover", "coilovers", "remap", "mapped", "exhaust",
+    "suspension", "short shift", "aero", "splitter", "ducktail", "roll cage", "cage",
+    "bucket", "buckets", "carbon", "lw", "lightweight", "clubsport", "cs", "widebody",
+]
 
 def normalize_ownership(_raw: Optional[str], source_text: str) -> str:
     """
     Business rule:
-    - Default to Current unless explicit sold/ex tokens appear.
+    - Default to Current unless explicit sold/ex tokens appear in the supporting source_text.
     """
     st = (source_text or "").strip()
     if SOLD_TOKENS_RE.search(st):
         return "Sold"
     return "Current"
 
+def extract_year_from_text(text: str) -> Optional[int]:
+    """
+    Extract a likely model year from source_text.
+    Prefer 4-digit years.
+    If only 2-digit appears: 70–99 => 19xx, 00–29 => 20xx
+    """
+    t = (text or "")
+
+    m4 = FOUR_DIGIT_YEAR_RE.search(t)
+    if m4:
+        return int(m4.group(1))
+
+    # Look for 2-digit with common formats:
+    # "'97", "97", "MY97", "97MY"
+    m = re.search(r"(?:\bMY)?('?)(\d{2})(?:\bMY|\b)", t, flags=re.IGNORECASE)
+    if m:
+        yy = int(m.group(2))
+        if 70 <= yy <= 99:
+            return 1900 + yy
+        if 0 <= yy <= 29:
+            return 2000 + yy
+
+    return None
+
+def ensure_notes_contains(notes: Optional[str], addition: str) -> Optional[str]:
+    add = (addition or "").strip()
+    if not add:
+        return notes
+    n = (notes or "").strip()
+    if not n:
+        return add
+    # prevent obvious duplicates
+    if add.lower() in n.lower():
+        return n
+    return f"{add}; {n}"
+
 def move_year_out_of_model(model: Optional[str], notes: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    If model contains a literal year (especially like 911 (1988)), remove it and push year into notes.
+    If model contains a literal year in parentheses (e.g. 911 (1988)), remove it and push year into notes.
     """
     if not model:
         return model, notes
@@ -476,20 +394,16 @@ def move_year_out_of_model(model: Optional[str], notes: Optional[str]) -> Tuple[
         m = MODEL_YEAR_IN_PARENS_RE.sub("", m).strip()
         m = re.sub(r"\s+", " ", m).strip()
         m = m.replace("()", "").strip()
-
-        notes_out = (notes or "").strip()
-        if yr and yr not in notes_out:
-            notes_out = (f"{yr}" if not notes_out else f"{yr}; {notes_out}")
-        return (m or None), (notes_out or None)
+        notes = ensure_notes_contains(notes, yr)
+        return (m or None), (notes or None)
 
     return model, notes
 
-def apply_gt3_dot2_hint(model: Optional[str], variant: Optional[str], source_text: str) -> Optional[str]:
+def apply_gt3_dot2_hint(model: Optional[str], source_text: str) -> Optional[str]:
     """
-    If someone writes 'GT3.2' or '996 GT3.2', interpret .2 as gen 2 for common platforms.
+    If someone writes 'GT3.2' (common enthusiast shorthand), interpret '.2' as Gen 2 for the platform if present.
     """
     st = (source_text or "").lower()
-
     if "gt3.2" in st or "gt3 .2" in st:
         if "996" in st:
             return "911 (996.2)"
@@ -499,8 +413,103 @@ def apply_gt3_dot2_hint(model: Optional[str], variant: Optional[str], source_tex
             return "911 (991.2)"
         if "992" in st:
             return "911 (992.2)"
-
     return model
+
+def is_911_family(source_text: str, model: Optional[str], variant: Optional[str]) -> bool:
+    st = (source_text or "").lower()
+    m = (model or "").lower()
+    v = (variant or "").lower()
+    return (
+        any(tok in st for tok in ["911", "carrera", "turbo", "gt3", "gt2", "rs", "targa"])
+        or "911" in m
+        or any(tok in v for tok in ["carrera", "turbo", "gt3", "gt2", "rs", "targa"])
+    )
+
+def enforce_911_platform_from_year(
+    model: Optional[str],
+    notes: Optional[str],
+    source_text: str,
+    variant: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    If year is present and the chunk is clearly 911-family, FORCE the correct platform from year.
+    This prevents errors like 1997 => 996 or 1988 => 964/993.
+    """
+    year = extract_year_from_text(source_text)
+    if not year or not is_911_family(source_text, model, variant):
+        return model, notes
+
+    # Always store the year in notes
+    notes = ensure_notes_contains(notes, str(year))
+
+    # Year -> platform mapping (aligned to your cheat sheet + sensible overlaps)
+    if 1964 <= year <= 1973:
+        return "911 (Early 911)", notes
+    if 1974 <= year <= 1989:
+        # More specific subtypes (SC/3.2) are variant-ish; model stays generic.
+        # But you wanted 1984–1989 to be 3.2 Carrera explicitly, so we do that:
+        if 1984 <= year <= 1989:
+            return "911 (3.2 Carrera)", notes
+        if 1978 <= year <= 1983:
+            return "911 (SC)", notes
+        return "911 (G-Series)", notes
+    if 1989 <= year <= 1994:
+        if year == 1994:
+            return "911 (964 / 993)", notes
+        return "911 (964)", notes
+    if 1994 <= year <= 1998:
+        return "911 (993)", notes
+    if 1998 <= year <= 2001:
+        return "911 (996.1)", notes
+    if 2002 <= year <= 2004:
+        return "911 (996.2)", notes
+    if 2004 <= year <= 2008:
+        return "911 (997.1)", notes
+    if 2009 <= year <= 2012:
+        return "911 (997.2)", notes
+    if 2011 <= year <= 2015:
+        return "911 (991.1)", notes
+    if 2016 <= year <= 2019:
+        return "911 (991.2)", notes
+    if 2019 <= year <= 2024:
+        return "911 (992.1)", notes
+    if year >= 2024:
+        return "911 (992.2)", notes
+
+    return model, notes
+
+def force_extracted_details_into_notes(notes: Optional[str], source_text: str) -> Optional[str]:
+    """
+    Deterministically ensure we capture obvious "notes-ish" details that the model might forget:
+    - year
+    - gearbox tokens
+    - obvious colour tokens
+    - common option/mod tokens
+    """
+    st = (source_text or "")
+    lower = st.lower()
+
+    # year
+    year = extract_year_from_text(st)
+    if year:
+        notes = ensure_notes_contains(notes, str(year))
+
+    # gearbox
+    for g in GEARBOX_TOKENS:
+        if re.search(rf"\b{re.escape(g)}\b", lower):
+            notes = ensure_notes_contains(notes, g.upper() if g == "pdk" else g.title())
+
+    # colours (best-effort; we keep as found token)
+    for c in COMMON_COLOUR_TOKENS:
+        if c in lower:
+            notes = ensure_notes_contains(notes, c.title() if c.islower() else c)
+
+    # mods/options
+    for t in MOD_TOKENS:
+        if re.search(rf"\b{re.escape(t)}\b", lower):
+            notes = ensure_notes_contains(notes, t.upper() if t.startswith("x") else t)
+
+    return notes
 
 # ----------------------------
 # Main run loop
@@ -580,14 +589,23 @@ def run_parse(run_id: str, start_member_id: int, max_member_id: int):
                             source_text = safe_str(car.get("source_text")) or ""
                             confidence = clamp01(float(car.get("confidence") or 0.0))
 
-                            # Must have evidence
                             if not source_text.strip():
                                 continue
 
-                            # Hard rules
+                            # Hard business rules
                             ownership = normalize_ownership(safe_str(car.get("ownership")), source_text)
+
+                            # Keep model clean
                             model, notes = move_year_out_of_model(model, notes)
-                            model = apply_gt3_dot2_hint(model, variant, source_text)
+
+                            # Interpret GT3.2 etc
+                            model = apply_gt3_dot2_hint(model, source_text)
+
+                            # Force year -> platform for 911-family (prevents the big "this should be simple" misses)
+                            model, notes = enforce_911_platform_from_year(model, notes, source_text, variant)
+
+                            # Ensure year/colour/mods/gearbox live in notes (best-effort)
+                            notes = force_extracted_details_into_notes(notes, source_text)
 
                             pending_rows.append(
                                 {
